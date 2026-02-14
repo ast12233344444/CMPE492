@@ -1,7 +1,7 @@
 import torch
 from nnsight import NNsight
 from torch.nn import functional as F
-from Attribute import backprop_through_layernorm_functional
+from attribute import backprop_through_layernorm_functional
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
