@@ -1,0 +1,16 @@
+env/*
+copy_STUFF/*
+COPY_STUFF/EAP-EAPIG/.ipynb_checkpoints/eap_ioi_demo-checkpoint.ipynb
+__pycache__/*
+utils/.ipynb_checkpoints/*
+utils/__pycache__/*
+ioi_task/.ipynb_checkpoints/*
+ioi_task/__pycache__/*
+ims/*.png
+ioi_task/ims/*.png
+docstring_task/ims/*.png
+.python-version
+ims/*
+.python-version
+greaterthan_task/ims/*
+.vscode
