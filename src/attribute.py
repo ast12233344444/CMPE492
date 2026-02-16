@@ -1,8 +1,10 @@
+import json
 import os
 
 import numpy as np
 import torch
 from matplotlib import pyplot as plt
+from tqdm import tqdm
 from transformers import ViTImageProcessor, ViTForImageClassification
 from nnsight import NNsight
 from PIL import Image
@@ -15,10 +17,10 @@ import edge_effect_isolation
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 #TODO List
-#   Activation Patching to see how much the loss decreases
+#   Activation Patching to see how much the loss decreases Done
 #   EAP-IG
-#   Edge Corruption Maximization
-#   Edge Significance (consistency)
+#   Edge Corruption Maximization Done
+#   Edge Significance (consistency) Done
 
 
 def backprop_through_layernorm_functional(grad_post_ln, resid_input, ln_module):
@@ -44,7 +46,9 @@ def backprop_through_layernorm_functional(grad_post_ln, resid_input, ln_module):
     # grads is a tuple (grad_x,), so we take the first element
     return grads[0]
 
-def EAP(model, graph, input_clean, input_adversarial, truth_label=None, batch_size=8, invert=False):
+def EAP(model, graph, input_clean, input_adversarial, truth_label=None,
+        batch_size=8, invert=False, img_path="pruned_compgraph.png",
+        metric_fn = F.cross_entropy):
     model_nnsight = NNsight(model)
 
     n_layers = 12
@@ -52,23 +56,18 @@ def EAP(model, graph, input_clean, input_adversarial, truth_label=None, batch_si
     d_model = 768
     head_dim = d_model // n_heads
 
-    # Initialize accumulators for edge scores
-    # We will sum the scores across batches and divide by total samples at the end
     edge_accumulators = {edge: 0.0 for edge in graph.edges}
     n_total = input_clean.shape[0]
 
-    # Create batches
     num_batches = (n_total + batch_size - 1) // batch_size
     print(f"Processing {n_total} samples in {num_batches} batches (Batch size: {batch_size})...")
 
-    for batch_idx in range(num_batches):
+    for batch_idx in tqdm(range(num_batches), f"processing batches..."):
         start = batch_idx * batch_size
         end = min(start + batch_size, n_total)
 
         current_clean = input_clean[start:end]
         current_adv = input_adversarial[start:end]
-
-        print(f"  Batch {batch_idx + 1}/{num_batches}: samples {start} to {end}")
 
         # Local storage for this batch
         clean_out = {}
@@ -114,7 +113,7 @@ def EAP(model, graph, input_clean, input_adversarial, truth_label=None, batch_si
 
                 logits = model_nnsight.classifier.output.save()
 
-                metric = F.cross_entropy(logits, torch.tensor([truth_label for _ in range(batch_size)], device=device))
+                metric = metric_fn(logits, torch.tensor([truth_label for _ in range(batch_size)], device=device))
 
                 metric.backward()
 
@@ -172,7 +171,6 @@ def EAP(model, graph, input_clean, input_adversarial, truth_label=None, batch_si
             else:
                 edge_accumulators[edge] -= score.item()
 
-    print("Finalizing graph scores...")
     scores =[]
     for edge in graph.edges:
         scores.append( edge_accumulators[edge] / n_total )
@@ -183,14 +181,9 @@ def EAP(model, graph, input_clean, input_adversarial, truth_label=None, batch_si
     plt.show()
 
     graph.reset(False)
-    #graph.apply_threshold(0.002, absolute=False, reset=True, prune=False)
     graph.apply_topn(50, absolute=False, reset=True, prune=False)
-    in_edges = 0
-    for edge in graph.edges:
-        if graph.edges[edge].in_graph:
-            in_edges += 1
-    print(in_edges)
-    graph.to_image("pruned_compgraph.png")
+
+    graph.to_image(img_path)
 
 def generate_dataset(data_path, processor, true_label, adversarial_label):
 
@@ -218,6 +211,110 @@ def generate_dataset(data_path, processor, true_label, adversarial_label):
 
     return input_clean, input_adversarial
 
+def generate_pairwise_dataset(data_path, processor, true_label, distorted_label):
+    path_clean = os.path.join(data_path, true_label, true_label)
+    path_corrupted = os.path.join(data_path, true_label, distorted_label)
+    files_clean = os.listdir(path_clean)
+    files_corrupted = os.listdir(path_corrupted)
+    dpoints_clean = []
+    dpoints_adversarial = []
+    for file in files_clean:
+        dpoint_clean = Image.open(os.path.join(path_clean, file)).convert("RGB")
+        dpoints_clean.append(dpoint_clean)
+        dpoint_adversarial = Image.open(os.path.join(path_corrupted, file)).convert("RGB")
+        dpoints_adversarial.append(dpoint_adversarial)
+
+    input_adversarial = processor(images=dpoints_adversarial, return_tensors="pt")["pixel_values"].to(device)
+    input_clean = processor(images=dpoints_clean, return_tensors="pt")["pixel_values"].to(device)
+
+    return input_clean, input_adversarial
+
+def analyse_pairwise_corruption(model, processor, true_label, distorted_label, true_label_i, distorted_label_i):
+    print(f"analyzing {true_label} to  {distorted_label}")
+    datas_clean, datas_adversarial = generate_pairwise_dataset(
+        "/home/ahmet/PycharmProjects/CMPE492/pairwise_adv_dataset", processor,
+        true_label, distorted_label)
+
+    #datas_adversarial, datas_clean = datas_adversarial[:16], datas_clean[:16]
+
+    def metric(logits, unused):
+        return (logits[:, distorted_label_i] - logits[:, true_label_i]).mean()
+
+    compGraph = ViTCompGraph.Graph.from_model(model)
+
+    EAP(model, compGraph, datas_clean, datas_adversarial, true_label_i,
+        img_path=f"results/{true_label}->{distorted_label}_compgraph.png", metric_fn = metric)
+
+    edge_names = []
+    for edge in compGraph.edges:
+        edgeObj = compGraph.edges[edge]
+        if edgeObj.in_graph:
+            edge_names.append(edgeObj.name)
+
+    patched_loss_improvements = {}
+    pli = []
+
+    full_loss, full_loss_cache = patch_activations(model, [],
+                                         datas_clean, datas_adversarial,
+                                         torch.tensor([truth_label for _ in range(len(datas_clean))]),
+                                         metric)
+
+    full_clean, full_clean_cache = patch_activations(model, [],
+                                                     datas_adversarial, datas_clean,
+                                                     torch.tensor([truth_label for _ in range(len(datas_clean))]),
+                                                     metric)
+
+    imp = full_loss - full_clean
+    stdev = np.std(full_loss_cache - full_clean_cache)
+    pli.append({"edge": "full_attack", "improvement": imp, "stdev": stdev, "robustness": imp / stdev})
+
+    for i in range(len(edge_names)):
+        edges_to_patch = [edge_names[i]]
+
+        patched_loss, patched_loss_cache = patch_activations(model, edges_to_patch,
+                                                         datas_clean, datas_adversarial,
+                                                         torch.tensor([truth_label for _ in range(len(datas_clean))]),
+                                                         metric)
+        imp = full_loss - patched_loss
+        stdev = np.std(full_loss_cache - patched_loss_cache)
+        if stdev > 0:
+            patched_loss_improvements[edge_names[i]] = {"improvement": imp, "stdev": stdev, "robustness": imp/stdev}
+            pli.append({"edge": edge_names[i], "improvement": imp, "stdev": stdev, "robustness": imp/stdev})
+        else:
+            patched_loss_improvements[edge_names[i]] = {"improvement": imp, "stdev": stdev, "robustness": 0}
+            pli.append({"edge": edge_names[i], "improvement": imp, "stdev": stdev, "robustness": 0})
+
+    pli = sorted(pli, key=lambda x: x["improvement"], reverse=True)
+
+    json_path = f"results/{true_label}->{distorted_label}_impedgeinfo.json"
+    with open(json_path, 'w') as f:
+        json.dump(pli, f, indent=4)
+
+    # We'll plot the top 50 edges for clarity
+    plot_data = pli
+    names = [x["edge"] for x in plot_data]
+    robustness_vals = [x["robustness"] for x in plot_data]
+    improvement_vals = [x["improvement"] for x in plot_data]
+
+    fig, ax1 = plt.subplots(figsize=(12, 15))
+
+    y_pos = np.arange(len(names))
+
+    # Plot Robustness as the primary metric
+    bars = ax1.barh(y_pos, robustness_vals, align='center', color='skyblue', label='Robustness (Imp/Std)')
+    ax1.set_yticks(y_pos)
+    ax1.set_yticklabels(names, fontsize=8)
+    ax1.invert_yaxis()  # Highest robustness at the top
+    ax1.set_xlabel('Robustness Score')
+    ax1.set_title(f'Edge Importance: {true_label} -> {distorted_label}')
+
+    ax2 = ax1.twiny()
+    ax2.plot(improvement_vals, y_pos, 'ro', markersize=4, label='Raw Improvement')
+    ax2.set_xlabel('Raw Loss Improvement')
+
+    fig.tight_layout()
+    plt.savefig(f"results/{true_label}->{distorted_label}_impedgeinfo.png")
+    plt.close()
 
 def plot_denormalized_img(tensor_img, processor, title="Clean Image"):
     # 1. Clone to avoid modifying the original tensor
@@ -255,9 +352,17 @@ if __name__ == '__main__':
     truth_label = 9
     adversarial_label = 1
 
-    data_size = 8
+    for true_i in range(len(classes)):
+        for corr_i in range(len(classes)):
+            if true_i == corr_i:
+                continue
+            if os.path.exists(os.path.join(f"/home/ahmet/PycharmProjects/CMPE492/results/{classes[true_i]}->{classes[corr_i]}_impedgeinfo.png")):
+                continue
+            analyse_pairwise_corruption(model, processor, classes[true_i], classes[corr_i], true_i, corr_i)
+
+    """data_size = 8
     input_clean, input_adversarial = generate_dataset(
-        "/adv_dataset_fadgdbg",processor,
+        "/adv_dataset",processor,
         classes[truth_label], classes[adversarial_label])
     input_clean = input_clean[:data_size]
     input_adversarial = input_adversarial[:data_size]
@@ -324,7 +429,7 @@ if __name__ == '__main__':
         plt.imshow(img_np)
         plt.title(f"Loss {'Maxxed' if los_max else 'Minned'} on {edge_name}")
         plt.axis('off')
-        plt.show()
+        plt.show()"""
 
 
 
