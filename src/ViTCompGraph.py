@@ -888,7 +888,6 @@ class Graph:
         Filename: the filename to save the graph to
         Colorscheme: a cmap colorscheme
         """
-        print("graph.to_image got called")
         import pygraphviz as pgv
         g = pgv.AGraph(directed=True, bgcolor="white", overlap="false", splines="true", layout=layout)
 
@@ -906,7 +905,6 @@ class Graph:
                            shape="box",
                            fontname="Helvetica",
                            )
-        print("nodes added to graph.")
 
         scores = self.scores.view(-1).abs()
         max_score = scores.max().item()
@@ -922,6 +920,4 @@ class Graph:
                            color=get_color(edge.qkv, edge.score),
                            )
 
-        print("edges added to graph.")
         g.draw(filename, prog="dot")
-        print("graph drawn.")
