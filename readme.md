@@ -24,7 +24,10 @@ note that this doesn't estimate the difference when we patch corrupted activatio
 
 $$Score \approx (l_{clean} - l_{corrupted}) \cdot \frac{\partial M(x_{corr}, x_{clean})}{\partial I_{corrupted}}$$
 
-this directly estimates the effect we
+this directly estimates the effect we get when we patch corrupted inputs with clean edge activations, and gives much better filtering of edges than converse empirically on regular coarse transformations,
+hence we use this to filter edges during coarse transformation circuit detection.
+
+after filtering all set of edges to say 50 most influential ones to our metric, we try patching each one one by one, to get the actual importances they pose for the metric at hand.
 
 ### Edge Activation patching
 
