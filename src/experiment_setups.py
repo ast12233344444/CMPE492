@@ -6,11 +6,15 @@ import random
 import numpy as np
 from PIL import Image
 import torch
+from PIL.ImageChops import offset
 from matplotlib import pyplot as plt
+from sympy.strategies.core import switch
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from src import ViTCompGraph
 from src.TracingAlgorithms import TracingAlgorithms
+from src.data_setups import TargetCorruptedImageDataset
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -19,89 +23,76 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class Experiments:
     @staticmethod
-    def analyse_topk_contribution(model, processor, classes, n_samples=90 * 10, topk_plots=[1, 2, 3, 5, 10]):
+    def analyse_topk_contribution(model, data_path, processor, classes,
+                                  n_samples=90 * 10, topk_plots=[1, 2, 3, 5, 10],
+                                  measure_at_logit="out", metric_factory=None, metric_target="inc"):
         n_samples_per_class = (n_samples + len(classes) * (len(classes) - 1) - 1) // (len(classes) * (len(classes) - 1))
-        samples_clean = []
-        samples_adversarial = []
-        labels = []
+        dataloaders =[[None for _ in range(len(classes))] for _ in range(len(classes))]
+
+        topk = {k: [] for k in topk_plots}
+        topk_inclusions = {k: {} for k in topk_plots}
+        topk_inclusions["total_trials"] = n_samples
+        sole_edge_improvements = {}
         for true_i in range(len(classes)):
             for corr_i in range(len(classes)):
                 if true_i == corr_i:
                     continue
                 begin_idx = (true_i * (len(classes) - 1) + corr_i) * n_samples_per_class
                 end_idx = min(begin_idx + n_samples_per_class, n_samples)
+                my_dataset = TargetCorruptedImageDataset(
+                    data_path=data_path,
+                    processor=processor,
+                    true_label=classes[true_i],
+                    distorted_label=classes[corr_i],
+                    offset = begin_idx,
+                )
+                my_dataset.n_samples = end_idx - begin_idx
 
-                path_clean = os.path.join("/home/ahmet/PycharmProjects/CMPE492/pairwise_adv_dataset", classes[true_i],
-                                          classes[true_i])
-                path_corrupted = os.path.join("/home/ahmet/PycharmProjects/CMPE492/pairwise_adv_dataset",
-                                              classes[true_i], classes[corr_i])
-                names = os.listdir(path_clean)
-                names = random.sample(names, end_idx - begin_idx)
-                for sample_idx in range(len(names)):
-                    dpoint_clean = Image.open(os.path.join(path_clean, names[sample_idx])).convert("RGB")
-                    dpoint_adversarial = Image.open(os.path.join(path_corrupted, names[sample_idx])).convert("RGB")
-                    samples_clean.append(dpoint_clean)
-                    samples_adversarial.append(dpoint_adversarial)
-                    labels.append((true_i, corr_i))
+                dataloader = DataLoader(my_dataset, batch_size=1, shuffle=True, num_workers=1)
 
-        input_adversarial = processor(images=samples_adversarial, return_tensors="pt")["pixel_values"].to(device)
-        input_clean = processor(images=samples_clean, return_tensors="pt")["pixel_values"].to(device)
+                for clean, adversarial in tqdm(dataloader, "loading data..."):
+                    metric = metric_factory(true_i, corr_i)
 
-        topk = {k: [] for k in topk_plots}
-        topk_inclusions = {k: {} for k in topk_plots}
-        topk_inclusions["total_trials"] = n_samples
-        sole_edge_improvements = {}
-        for i in range(len(samples_clean)):
-            true_i, corr_i = labels[i]
-            clean = input_clean[i:(i + 1)]
-            adversarial = input_adversarial[i:(i + 1)]
+                    compGraph = ViTCompGraph.Graph.from_model(model)
 
-            def metric(logits, unused):
-                return (logits[:, corr_i] - logits[:, true_i]).mean()
+                    TracingAlgorithms.EAP_direct(model, compGraph, adversarial, clean, metric_fn=metric, measure_at_logit=measure_at_logit, metric_target=metric_target)
 
-            compGraph = ViTCompGraph.Graph.from_model(model)
+                    edge_names = []
+                    for edge in compGraph.edges:
+                        edgeObj = compGraph.edges[edge]
+                        if edgeObj.in_graph:
+                            edge_names.append(edgeObj.name)
+                    pli = []
+                    full_loss = TracingAlgorithms.patch_activations_direct(model, [],
+                                                                                     clean, adversarial,
+                                                                                     metric, measure_at_logit=measure_at_logit)
+                    full_clean = TracingAlgorithms.patch_activations_direct(model, [],
+                                                                                       adversarial, clean,
+                                                                                       metric, measure_at_logit=measure_at_logit)
+                    full_attack = full_loss - full_clean
+                    for i in range(len(edge_names)):
+                        if edge_names[i] not in sole_edge_improvements:
+                            sole_edge_improvements[edge_names[i]] = []
+                        edges_to_patch = [edge_names[i]]
 
-            TracingAlgorithms.EAP(model, compGraph, clean, adversarial, true_i,
-                                  img_path=f"ignore_compgraph.png", metric_fn=metric)
-
-            edge_names = []
-            for edge in compGraph.edges:
-                edgeObj = compGraph.edges[edge]
-                if edgeObj.in_graph:
-                    edge_names.append(edgeObj.name)
-            pli = []
-            full_loss, full_loss_cache = TracingAlgorithms.patch_activations(model, [],
-                                                                             clean, adversarial,
-                                                                             torch.tensor([true_i]),
-                                                                             metric)
-            full_clean, full_clean_cache = TracingAlgorithms.patch_activations(model, [],
-                                                                               adversarial, clean,
-                                                                               torch.tensor([true_i]),
-                                                                               metric)
-            full_attack = full_loss - full_clean
-            for i in tqdm(range(len(edge_names)), f"patching edges..."):
-                if edge_names[i] not in sole_edge_improvements:
-                    sole_edge_improvements[edge_names[i]] = []
-                edges_to_patch = [edge_names[i]]
-
-                patched_loss, patched_loss_cache = TracingAlgorithms.patch_activations(model, edges_to_patch,
-                                                                                       clean, adversarial,
-                                                                                       torch.tensor([true_i]), metric)
-                imp = full_loss - patched_loss
-                pli.append((imp, edge_names[i]))
-                sole_edge_improvements[edge_names[i]].append(imp/full_attack)
-            pli = sorted(pli, reverse=True)
-            for k in topk_plots:
-                topk_edges = [edge_name for (edge_score, edge_name) in pli[:k]]
-                patched_loss, patched_loss_cache = TracingAlgorithms.patch_activations(model, topk_edges,
-                                                                                       clean, adversarial,
-                                                                                       torch.tensor([true_i]), metric)
-                topk[k].append((full_loss - patched_loss)/full_attack)
-                for edge in topk_edges:
-                    if edge in topk_inclusions[k]:
-                        topk_inclusions[k][edge] += 1
-                    else:
-                        topk_inclusions[k][edge] = 1
+                        patched_loss = TracingAlgorithms.patch_activations_direct(model, edges_to_patch,
+                                                                                    clean, adversarial,
+                                                                                    metric, measure_at_logit=measure_at_logit)
+                        imp = full_loss - patched_loss
+                        pli.append((imp, edge_names[i]))
+                        sole_edge_improvements[edge_names[i]].append(imp / full_attack)
+                    pli = sorted(pli, reverse=True)
+                    for k in topk_plots:
+                        topk_edges = [edge_name for (edge_score, edge_name) in pli[:k]]
+                        patched_loss = TracingAlgorithms.patch_activations_direct(model, topk_edges,
+                                                                                    clean, adversarial,
+                                                                                    metric, measure_at_logit=measure_at_logit)
+                        topk[k].append((full_loss - patched_loss) / full_attack)
+                        for edge in topk_edges:
+                            if edge in topk_inclusions[k]:
+                                topk_inclusions[k][edge] += 1
+                            else:
+                                topk_inclusions[k][edge] = 1
 
         ###---- PLOTTING OF THE SOLE EDGE IMPORTANCE HISTOGRAMS-----
         max_set = [(value, key) for (key, value) in topk_inclusions[topk_plots[-1]].items()]
@@ -197,40 +188,17 @@ class Experiments:
         ###---- PLOTTING THE TOPK EDGE IMPROVEMENT PLOTS--------
 
     @staticmethod
-    def analyse_pairwise_corruption(model, processor, true_label, distorted_label, true_label_i, distorted_label_i):
+    def analyse_pairwise_corruption(model, dataloader, title, metric, measure_at_logit, metric_target="dec", switch_sides=False):
 
-        def generate_pairwise_dataset(data_path, processor, true_label, distorted_label):
-            path_clean = os.path.join(data_path, true_label, true_label)
-            path_corrupted = os.path.join(data_path, true_label, distorted_label)
-            files_clean = os.listdir(path_clean)
-            files_corrupted = os.listdir(path_corrupted)
-            dpoints_clean = []
-            dpoints_adversarial = []
-            for file in files_clean:
-                dpoint_clean = Image.open(os.path.join(path_clean, file)).convert("RGB")
-                dpoints_clean.append(dpoint_clean)
-                dpoint_adversarial = Image.open(os.path.join(path_corrupted, file)).convert("RGB")
-                dpoints_adversarial.append(dpoint_adversarial)
-
-            input_adversarial = processor(images=dpoints_adversarial, return_tensors="pt")["pixel_values"].to(device)
-            input_clean = processor(images=dpoints_clean, return_tensors="pt")["pixel_values"].to(device)
-
-            return input_clean, input_adversarial
-
-        print(f"analyzing {true_label} to  {distorted_label}")
-        datas_clean, datas_adversarial = generate_pairwise_dataset(
-            "/home/ahmet/PycharmProjects/CMPE492/pairwise_adv_dataset", processor,
-            true_label, distorted_label)
-
-        # datas_adversarial, datas_clean = datas_adversarial[:16], datas_clean[:16]
-
-        def metric(logits, unused):
-            return (logits[:, distorted_label_i] - logits[:, true_label_i]).mean()
+        print(f"analyzing {title}")
 
         compGraph = ViTCompGraph.Graph.from_model(model)
-
-        TracingAlgorithms.EAP(model, compGraph, datas_clean, datas_adversarial, true_label_i,
-                              img_path=f"results/{true_label}->{distorted_label}_compgraph.png", metric_fn=metric)
+        if not os.path.exists(f"/home/ahmet/PycharmProjects/CMPE492/results/{title}/"):
+            os.mkdir(f"/home/ahmet/PycharmProjects/CMPE492/results/{title}/")
+        TracingAlgorithms.EAP(model, compGraph, dataloader,
+                              img_path=f"/home/ahmet/PycharmProjects/CMPE492/results/{title}/compgraph.png",
+                              metric_fn=metric, measure_at_logit=measure_at_logit, metric_target=metric_target,
+                              switch_sides=switch_sides)
 
         edge_names = []
         for edge in compGraph.edges:
@@ -241,40 +209,39 @@ class Experiments:
         patched_loss_improvements = {}
         pli = []
 
-        full_loss, full_loss_cache = TracingAlgorithms.patch_activations(model, [],
-                                                                         datas_clean, datas_adversarial,
-                                                                         torch.tensor([]),
-                                                                         metric)
+        full_corr_metric, full_corr_metric_cache = TracingAlgorithms.patch_activations(model, [],
+                                                                         dataloader,
+                                                                         metric, measure_at_logit=measure_at_logit)
 
-        full_clean, full_clean_cache = TracingAlgorithms.patch_activations(model, [],
-                                                                           datas_adversarial, datas_clean,
-                                                                           torch.tensor([]),
-                                                                           metric)
+        full_clean_metric, full_clean_metric_cache = TracingAlgorithms.patch_activations(model, [],
+                                                                           dataloader,
+                                                                           metric, measure_at_logit=measure_at_logit, flip_dl=True)
 
-        imp = full_loss - full_clean
-        stdev = np.std(full_loss_cache - full_clean_cache)
-        pli.append({"edge": "full_attack", "improvement": imp, "stdev": stdev, "robustness": imp / stdev})
+        if measure_at_logit == "in":
+            deviation = (full_corr_metric + full_clean_metric) / 2
+        else:
+            deviation = (full_corr_metric - full_clean_metric)
+
+        print(full_corr_metric, full_clean_metric, deviation)
+        stdev = np.std(full_corr_metric_cache - full_clean_metric_cache)
+        pli.append({"edge": "full_attack", "improvement": deviation, "stdev": stdev, "robustness": deviation / stdev})
 
         for i in range(len(edge_names)):
             edges_to_patch = [edge_names[i]]
 
             patched_loss, patched_loss_cache = TracingAlgorithms.patch_activations(model, edges_to_patch,
-                                                                                   datas_clean, datas_adversarial,
-                                                                                   torch.tensor([]),
-                                                                                   metric)
-            imp = full_loss - patched_loss
-            stdev = np.std(full_loss_cache - patched_loss_cache)
-            if stdev > 0:
-                patched_loss_improvements[edge_names[i]] = {"improvement": imp, "stdev": stdev,
-                                                            "robustness": imp / stdev}
-                pli.append({"edge": edge_names[i], "improvement": imp, "stdev": stdev, "robustness": imp / stdev})
-            else:
-                patched_loss_improvements[edge_names[i]] = {"improvement": imp, "stdev": stdev, "robustness": 0}
-                pli.append({"edge": edge_names[i], "improvement": imp, "stdev": stdev, "robustness": 0})
+                                                                                   dataloader,
+                                                                                   metric, measure_at_logit=measure_at_logit)
+            deviation = full_corr_metric - patched_loss
+            stdev = np.std(full_corr_metric_cache - patched_loss_cache)
+
+            patched_loss_improvements[edge_names[i]] = {"improvement": deviation, "stdev": stdev,
+                                                            "robustness": deviation / stdev}
+            pli.append({"edge": edge_names[i], "improvement": deviation, "stdev": stdev, "robustness": deviation / stdev})
 
         pli = sorted(pli, key=lambda x: x["improvement"], reverse=True)
 
-        json_path = f"results/{true_label}->{distorted_label}_impedgeinfo.json"
+        json_path = f"/home/ahmet/PycharmProjects/CMPE492/results/{title}/impedgeinfo.json"
         with open(json_path, 'w') as f:
             json.dump(pli, f, indent=4)
 
@@ -289,19 +256,19 @@ class Experiments:
         y_pos = np.arange(len(names))
 
         # Plot Robustness as the primary metric
-        ax1.barh(y_pos, robustness_vals, align='center', color='skyblue', label='Robustness (Imp/Std)')
+        ax1.barh(y_pos, improvement_vals, align='center', color='skyblue', label='Robustness (Imp/Std)')
         ax1.set_yticks(y_pos)
         ax1.set_yticklabels(names, fontsize=8)
         ax1.invert_yaxis()  # Highest robustness at the top
-        ax1.set_xlabel('Robustness Score')
-        ax1.set_title(f'Edge Importance: {true_label} -> {distorted_label}')
+        ax1.set_xlabel('Raw Loss Improvement')
+        ax1.set_title(f'Edge Importance: {title}')
 
-        ax2 = ax1.twiny()
-        ax2.plot(improvement_vals, y_pos, 'ro', markersize=4, label='Raw Improvement')
-        ax2.set_xlabel('Raw Loss Improvement')
+        #ax2 = ax1.twiny()
+        #ax2.plot(improvement_vals, y_pos, 'ro', markersize=4, label='Raw Improvement')
+        #ax2.set_xlabel('Raw Loss Improvement')
 
         fig.tight_layout()
-        plt.savefig(f"results/{true_label}->{distorted_label}_impedgeinfo.png")
+        plt.savefig(f"/home/ahmet/PycharmProjects/CMPE492/results/{title}/impedgeinfo.png")
         plt.close()
 
     @staticmethod

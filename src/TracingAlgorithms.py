@@ -68,268 +68,313 @@ class TracingAlgorithms:
         return clean_activations
 
     @staticmethod
-    def EAP(model_nnsight, graph, input_clean, input_adversarial, truth_label=None,
-            batch_size=8, invert=False, img_path="pruned_compgraph.png",
-            metric_fn = F.cross_entropy):
+    def EAP(model_nnsight, graph, dataloader
+            , img_path="pruned_compgraph.png",
+            metric_fn = None, measure_at_logit="out", metric_target = "dec",
+            switch_sides=False):
         n_layers = model_nnsight.config.num_hidden_layers
         n_heads = model_nnsight.config.num_attention_heads
         head_dim = model_nnsight.config.hidden_size // n_heads
 
-        edge_accumulators = {edge: 0.0 for edge in graph.edges}
-        n_total = input_clean.shape[0]
-
-        num_batches = (n_total + batch_size - 1) // batch_size
-        print(f"Processing {n_total} samples in {num_batches} batches (Batch size: {batch_size})...")
-
-        for batch_idx in tqdm(range(num_batches), f"processing batches..."):
-            start = batch_idx * batch_size
-            end = min(start + batch_size, n_total)
-
-            current_clean = input_clean[start:end]
-            current_adv = input_adversarial[start:end]
-
-            clean_out = {}
-            corrupted_out = {}
-            clean_in_grad = {}
-            with model_nnsight.trace() as tracer:
-
-                with tracer.invoke(current_clean) as invoker_clean:
-                    clean_out["input"] = model_nnsight.vit.embeddings.output.save()
-
-                    for layer_idx in range(n_layers):
-                        layer_module = model_nnsight.vit.encoder.layer[layer_idx]
-                        concat_heads = layer_module.attention.attention.output[0]
-                        W_O = layer_module.attention.output.dense.weight
-
-                        clean_out[f"resid_pre_ln_{layer_idx}"] = layer_module.layernorm_before.input.save()
-
-                        Q_grads = layer_module.attention.attention.query.output.grad
-                        W_Q = layer_module.attention.attention.query.weight
-                        K_grads = layer_module.attention.attention.key.output.grad
-                        W_K = layer_module.attention.attention.key.weight
-                        V_grads = layer_module.attention.attention.value.output.grad
-                        W_V = layer_module.attention.attention.value.weight
-
-                        for head_idx in range(n_heads):
-                            start = head_idx * head_dim
-                            end = (head_idx + 1) * head_dim
-                            head_z = concat_heads[:, :, start:end]
-                            W_O_head = W_O[:, start:end]
-                            clean_out[f"a{layer_idx}.h{head_idx}"] = (head_z @ W_O_head.T).save()
-
-                            clean_in_grad[f"a{layer_idx}.h{head_idx}<q>"] = (Q_grads[:, :, start:end] @ W_Q[start:end, :]).save()
-                            clean_in_grad[f"a{layer_idx}.h{head_idx}<k>"] = (K_grads[:, :, start:end] @ W_K[start:end, :]).save()
-                            clean_in_grad[f"a{layer_idx}.h{head_idx}<v>"] = (V_grads[:, :, start:end] @ W_V[start:end, :]).save()
-
-                        clean_in_grad[f"m{layer_idx}"] = layer_module.layernorm_after.input.grad.save()
-                        clean_out[f"m{layer_idx}"] = layer_module.output.dense.output.save()
-
-                    clean_in_grad["logits"] = model_nnsight.vit.layernorm.input.grad.save()
-
-                    logits = model_nnsight.classifier.output.save()
-
-                    metric = metric_fn(logits, torch.tensor([truth_label for _ in range(batch_size)], device=device))
-
-                    metric.backward()
-
-                with tracer.invoke(current_adv) as invoker_adversarial:
-                    corrupted_out["input"] = model_nnsight.vit.embeddings.output.save()
-
-                    for layer_idx in range(n_layers):
-                        layer_module = model_nnsight.vit.encoder.layer[layer_idx]
-                        concat_heads = layer_module.attention.attention.output[0]
-                        W_O = layer_module.attention.output.dense.weight
-
-                        for head_idx in range(n_heads):
-                            start = head_idx * head_dim
-                            end = (head_idx + 1) * head_dim
-                            head_z = concat_heads[:, :, start:end]
-                            W_O_head = W_O[:, start:end]
-                            corrupted_out[f"a{layer_idx}.h{head_idx}"] = (head_z @ W_O_head.T).save()
-
-                        corrupted_out[f"m{layer_idx}"] = layer_module.output.dense.output.save()
-
-            for key in clean_out:
-                clean_out[key] = clean_out[key].value
-            for key in clean_in_grad:
-                clean_in_grad[key] = clean_in_grad[key].value
-            for key in corrupted_out:
-                corrupted_out[key] = corrupted_out[key].value
-
-            for layer_idx in range(n_layers):
-                layer_input = clean_out[f"resid_pre_ln_{layer_idx}"]
-                ln_module = model_nnsight.vit.encoder.layer[layer_idx].layernorm_before
-                for head_idx in range(n_heads):
-                    clean_in_grad[f"a{layer_idx}.h{head_idx}<q>"] = TracingAlgorithms._backprop_through_layernorm_functional(
-                        clean_in_grad[f"a{layer_idx}.h{head_idx}<q>"], layer_input, ln_module)
-                    clean_in_grad[f"a{layer_idx}.h{head_idx}<k>"] = TracingAlgorithms._backprop_through_layernorm_functional(
-                        clean_in_grad[f"a{layer_idx}.h{head_idx}<k>"], layer_input, ln_module)
-                    clean_in_grad[f"a{layer_idx}.h{head_idx}<v>"] = TracingAlgorithms._backprop_through_layernorm_functional(
-                        clean_in_grad[f"a{layer_idx}.h{head_idx}<v>"], layer_input, ln_module)
-
-            for edge in graph.edges:
-                nodes = edge.split("->")
-                source = nodes[0]
-                target = nodes[1]
-
-                score = None
-                if clean_in_grad[target].dim() == 2: # target is logits
-                    score = torch.einsum("b c d, b d -> b c", corrupted_out[source] - clean_out[source], clean_in_grad[target])
-                    score = score.sum(dim=-1)
-                    score = score.sum()
-                else:
-                    score = torch.einsum("b c d, b c d-> b c", corrupted_out[source] - clean_out[source], clean_in_grad[target])
-                    score = score.sum(dim=-1)
-                    score = score.sum()
-                if not invert:
-                    edge_accumulators[edge] += score.item()
-                else:
-                    edge_accumulators[edge] -= score.item()
-
-        scores =[]
-        for edge in graph.edges:
-            scores.append( edge_accumulators[edge] / n_total )
-            graph.edges[edge].score = edge_accumulators[edge] / n_total
+        for current_clean, current_adv in tqdm(dataloader, desc="processing batches..."):
+            if switch_sides:
+                TracingAlgorithms.EAP_direct(model_nnsight, graph, current_adv, current_clean,
+                       metric_fn=metric_fn, measure_at_logit=measure_at_logit, metric_target=metric_target)
+            else:
+                TracingAlgorithms.EAP_direct(model_nnsight, graph, current_clean, current_adv,
+                                             metric_fn=metric_fn, measure_at_logit=measure_at_logit,
+                                             metric_target=metric_target)
 
         graph.reset(False)
-        graph.apply_topn(50, absolute=False, reset=True, prune=False)
+        if metric_target == "both":
+            graph.apply_greedy(50, absolute=True, reset=True, prune=False)
+        else:
+            #graph.apply_greedy(100, absolute=False, reset=True, prune=True)
+            graph.apply_topn(50, absolute=False, reset=True, prune=False)
 
         graph.to_image(img_path)
 
     @staticmethod
-    def patch_activations(model_nnsight, edges_to_patch, clean_input, corrupted_input, target, metric, batch_size = 8):
-        #CALCULTAES RESULTS BY CLEANING THE CORRUPTED OUTPUTS
+    def EAP_direct(model_nnsight, graph, current_clean, current_adv,
+            metric_fn=None, measure_at_logit="out", metric_target="dec"):
+        n_layers = model_nnsight.config.num_hidden_layers
+        n_heads = model_nnsight.config.num_attention_heads
+        head_dim = model_nnsight.config.hidden_size // n_heads
+
+        current_clean = current_clean.to(device)
+        current_adv = current_adv.to(device)
+        corrupted_out = {}
+        clean_out = {}
+        corrupted_in_grad = {}
+        logit_input_corrupted = None
+        with model_nnsight.trace() as tracer:
+
+            with tracer.invoke(current_clean) as invoker_adversarial:
+                clean_out["input"] = model_nnsight.vit.embeddings.output.save()
+
+                for layer_idx in range(n_layers):
+                    layer_module = model_nnsight.vit.encoder.layer[layer_idx]
+                    concat_heads = layer_module.attention.attention.output[0]
+                    W_O = layer_module.attention.output.dense.weight
+
+                    for head_idx in range(n_heads):
+                        start = head_idx * head_dim
+                        end = (head_idx + 1) * head_dim
+                        head_z = concat_heads[:, :, start:end]
+                        W_O_head = W_O[:, start:end]
+                        clean_out[f"a{layer_idx}.h{head_idx}"] = (head_z @ W_O_head.T).save()
+
+                    clean_out[f"m{layer_idx}"] = layer_module.output.dense.output.save()
+                    logit_input_corrupted = model_nnsight.vit.layernorm.input.save()
+
+            logit_input_corrupted = logit_input_corrupted.detach()
+
+            with tracer.invoke(current_adv) as invoker_clean:
+                corrupted_out["input"] = model_nnsight.vit.embeddings.output.save()
+
+                for layer_idx in range(n_layers):
+                    layer_module = model_nnsight.vit.encoder.layer[layer_idx]
+                    concat_heads = layer_module.attention.attention.output[0]
+                    W_O = layer_module.attention.output.dense.weight
+
+                    corrupted_out[f"resid_pre_ln_{layer_idx}"] = layer_module.layernorm_before.input.save()
+
+                    Q_grads = layer_module.attention.attention.query.output.grad
+                    W_Q = layer_module.attention.attention.query.weight
+                    K_grads = layer_module.attention.attention.key.output.grad
+                    W_K = layer_module.attention.attention.key.weight
+                    V_grads = layer_module.attention.attention.value.output.grad
+                    W_V = layer_module.attention.attention.value.weight
+
+                    for head_idx in range(n_heads):
+                        start = head_idx * head_dim
+                        end = (head_idx + 1) * head_dim
+                        head_z = concat_heads[:, :, start:end]
+                        W_O_head = W_O[:, start:end]
+                        corrupted_out[f"a{layer_idx}.h{head_idx}"] = (head_z @ W_O_head.T).save()
+
+                        corrupted_in_grad[f"a{layer_idx}.h{head_idx}<q>"] = (
+                                    Q_grads[:, :, start:end] @ W_Q[start:end, :]).save()
+                        corrupted_in_grad[f"a{layer_idx}.h{head_idx}<k>"] = (
+                                    K_grads[:, :, start:end] @ W_K[start:end, :]).save()
+                        corrupted_in_grad[f"a{layer_idx}.h{head_idx}<v>"] = (
+                                    V_grads[:, :, start:end] @ W_V[start:end, :]).save()
+
+                    corrupted_in_grad[f"m{layer_idx}"] = layer_module.layernorm_after.input.grad.save()
+                    corrupted_out[f"m{layer_idx}"] = layer_module.output.dense.output.save()
+
+                if measure_at_logit == "out":
+                    corrupted_in_grad["logits"] = model_nnsight.vit.layernorm.input.grad.save()
+                    logits = model_nnsight.classifier.output.save()
+                    metric = metric_fn(logits).save()
+                elif measure_at_logit == "in":
+                    corrupted_in_grad["logits"] = model_nnsight.vit.layernorm.input.grad.save()
+                    logit_input_clean = model_nnsight.vit.layernorm.input.save()
+                    metric = metric_fn(logit_input_clean, logit_input_corrupted).save()
+
+                metric.backward()
+
+        for key in corrupted_out:
+            corrupted_out[key] = corrupted_out[key].value
+        for key in corrupted_in_grad:
+            corrupted_in_grad[key] = corrupted_in_grad[key].value
+        for key in clean_out:
+            clean_out[key] = clean_out[key].value
+
+        for layer_idx in range(n_layers):
+            layer_input = corrupted_out[f"resid_pre_ln_{layer_idx}"]
+            ln_module = model_nnsight.vit.encoder.layer[layer_idx].layernorm_before
+            for head_idx in range(n_heads):
+                corrupted_in_grad[
+                    f"a{layer_idx}.h{head_idx}<q>"] = TracingAlgorithms._backprop_through_layernorm_functional(
+                    corrupted_in_grad[f"a{layer_idx}.h{head_idx}<q>"], layer_input, ln_module)
+                corrupted_in_grad[
+                    f"a{layer_idx}.h{head_idx}<k>"] = TracingAlgorithms._backprop_through_layernorm_functional(
+                    corrupted_in_grad[f"a{layer_idx}.h{head_idx}<k>"], layer_input, ln_module)
+                corrupted_in_grad[
+                    f"a{layer_idx}.h{head_idx}<v>"] = TracingAlgorithms._backprop_through_layernorm_functional(
+                    corrupted_in_grad[f"a{layer_idx}.h{head_idx}<v>"], layer_input, ln_module)
+
+        for edge in graph.edges:
+            nodes = edge.split("->")
+            source = nodes[0]
+            target = nodes[1]
+
+            if corrupted_in_grad[target].dim() == 2:  # target is logits
+                score = torch.einsum("b c d, b d -> b c", clean_out[source] - corrupted_out[source],
+                                     corrupted_in_grad[target])
+                score = score.sum(dim=-1)
+                score = score.sum()
+            else:
+                score = torch.einsum("b c d, b c d-> b c", clean_out[source] - corrupted_out[source],
+                                     corrupted_in_grad[target])
+                score = score.sum(dim=-1)
+                score = score.sum()
+            if metric_target == "dec":
+                score = -score
+            graph.edges[edge].score += score.item()
+
+
+        graph.reset(False)
+        if metric_target == "both":
+            graph.apply_topn(50, absolute=True, reset=True, prune=False)
+        else:
+            graph.apply_topn(50, absolute=False, reset=True, prune=False)
+
+    @staticmethod
+    def patch_activations(model_nnsight, edges_to_patch, dataloader, metric, measure_at_logit="out", flip_dl = False):
+        metric_cache = []
+
+        for input_cl, input_cor in tqdm(dataloader, desc="processing batches..."):
+            input_cl = input_cl.to(device)
+            input_cor = input_cor.to(device)
+            if flip_dl:
+                input_cl, input_cor = input_cor, input_cl
+            patched_loss = TracingAlgorithms.patch_activations_direct(model_nnsight, edges_to_patch, input_cl, input_cor, metric, measure_at_logit=measure_at_logit)
+            metric_cache.append(patched_loss)
+
+        return np.mean(metric_cache), np.array(metric_cache)
+
+    @staticmethod
+    def patch_activations_direct(model_nnsight, edges_to_patch, input_cl, input_cor, metric, measure_at_logit="out"):
         n_layers = model_nnsight.config.num_hidden_layers
         n_heads = model_nnsight.config.num_attention_heads
         head_dim = model_nnsight.config.hidden_size // n_heads
 
         edges_sorted = sorted(edges_to_patch, key=TracingAlgorithms._get_target_layer_index)
 
-        num_batches = (len(clean_input) + batch_size - 1) // batch_size
         metric_cache = []
 
-        for batch_idx in range(num_batches):
-            batch_start = batch_idx * batch_size
-            batch_end = (batch_idx + 1) * batch_size
-            input_cl = clean_input[batch_start:batch_end]
-            input_cor = corrupted_input[batch_start:batch_end]
-            target_batch = target[batch_start:batch_end]
+        clean_values = {}
+        clean_classifier_act = None
+        with model_nnsight.trace(input_cl):
+            clean_values["input"] = model_nnsight.vit.embeddings.output.save()
 
-            clean_values = {}
-            with model_nnsight.trace(input_cl):
-                clean_values["input"] = model_nnsight.vit.embeddings.output.save()
+            for layer_idx in range(n_layers):
+                layer_module = model_nnsight.vit.encoder.layer[layer_idx]
 
-                for layer_idx in range(n_layers):
-                    layer_module = model_nnsight.vit.encoder.layer[layer_idx]
+                clean_values[f"m{layer_idx}"] = layer_module.output.dense.output.save()
 
-                    clean_values[f"m{layer_idx}"] = layer_module.output.dense.output.save()
+                concat_heads = layer_module.attention.attention.output[0]
+                W_O = layer_module.attention.output.dense.weight
 
+                for h in range(n_heads):
+                    start, end = h * head_dim, (h + 1) * head_dim
+                    head_z = concat_heads[:, :, start:end]
+                    W_O_head = W_O[:, start:end]
+                    clean_values[f"a{layer_idx}.h{h}"] = (head_z @ W_O_head.T).save()
+            if measure_at_logit == "in":
+                clean_classifier_act = model_nnsight.vit.layernorm.input.save()
+            else:
+                clean_classifier_act = model_nnsight.classifier.output.save()
+
+        clean_classifier_act = clean_classifier_act.detach()
+
+        patched_logits = None
+        patched_loss = None
+
+        with model_nnsight.trace(input_cor) as tracer:
+
+            resids_pre_attention = {}
+            for edge in edges_sorted:
+                u, v = edge.split("->")
+
+                current_u_value = None
+
+                if u == "input":
+                    current_u_value = model_nnsight.vit.embeddings.output
+                elif u.startswith("m"):
+                    l_src = int(u[1:])
+                    current_u_value = model_nnsight.vit.encoder.layer[l_src].output.dense.output
+                elif u.startswith("a"):
+                    l_src = int(u.split(".")[0][1:])
+                    h_src = int(u.split(".")[1][1:])
+
+                    layer_module = model_nnsight.vit.encoder.layer[l_src]
                     concat_heads = layer_module.attention.attention.output[0]
                     W_O = layer_module.attention.output.dense.weight
 
-                    for h in range(n_heads):
-                        start, end = h * head_dim, (h + 1) * head_dim
-                        head_z = concat_heads[:, :, start:end]
-                        W_O_head = W_O[:, start:end]
-                        clean_values[f"a{layer_idx}.h{h}"] = (head_z @ W_O_head.T).save()
+                    start, end = h_src * head_dim, (h_src + 1) * head_dim
 
-            patched_logits = None
-            patched_loss = None
+                    head_z = concat_heads[:, :, start:end]
+                    W_O_head = W_O[:, start:end]
+                    current_u_value = head_z @ W_O_head.T
 
-            with model_nnsight.trace(input_cor) as tracer:
+                steering = clean_values[u] - current_u_value
 
-                resids_pre_attention = {}
-                for edge in edges_sorted:
-                    u, v = edge.split("->")
+                u_layer = None
+                if u == "input":
+                    u_layer = 0
+                elif u.startswith("a"):
+                    u_layer = int(u.split(".")[0][1:]) + 1
+                elif u.startswith("m"):
+                    u_layer = int(u[1:]) + 1
 
-                    current_u_value = None
+                v_layer = None
+                if v == "logits": v_layer = n_layers
+                if v.startswith("a"): v_layer = int(v.split(".")[0][1:])
+                if v.startswith("m"): v_layer = int(v[1:])
 
-                    if u == "input":
-                        current_u_value = model_nnsight.vit.embeddings.output
-                    elif u.startswith("m"):
-                        l_src = int(u[1:])
-                        current_u_value = model_nnsight.vit.encoder.layer[l_src].output.dense.output
-                    elif u.startswith("a"):
-                        l_src = int(u.split(".")[0][1:])
-                        h_src = int(u.split(".")[1][1:])
+                if v == "logits":
+                    model_nnsight.vit.layernorm.input += steering
 
-                        layer_module = model_nnsight.vit.encoder.layer[l_src]
-                        concat_heads = layer_module.attention.attention.output[0]
-                        W_O = layer_module.attention.output.dense.weight
+                elif v.startswith("a"):
+                    l_tgt = int(v.split(".")[0][1:])
+                    h_tgt = int(v.split(".")[1][1:-3])
+                    head_type = v.split(".")[1][-3:]
 
-                        start, end = h_src * head_dim, (h_src + 1) * head_dim
+                    layer_module = model_nnsight.vit.encoder.layer[l_tgt]
+                    ln_module = layer_module.layernorm_before
 
-                        head_z = concat_heads[:, :, start:end]
-                        W_O_head = W_O[:, start:end]
-                        current_u_value = head_z @ W_O_head.T
-
-                    steering = clean_values[u] - current_u_value
-
-                    u_layer = None
-                    if u == "input": u_layer = 0
-                    elif u.startswith("a"): u_layer = int(u.split(".")[0][1:]) + 1
-                    elif u.startswith("m"): u_layer = int(u[1:]) + 1
-
-                    v_layer = None
-                    if v == "logits": v_layer = n_layers
-                    if v.startswith("a"): v_layer = int(v.split(".")[0][1:])
-                    if v.startswith("m"): v_layer = int(v[1:])
-
-                    if v == "logits":
-                        model_nnsight.vit.layernorm.input += steering
-
-                    elif v.startswith("a"):
-                        l_tgt = int(v.split(".")[0][1:])
-                        h_tgt = int(v.split(".")[1][1:-3])
-                        head_type = v.split(".")[1][-3:]
-
-                        layer_module = model_nnsight.vit.encoder.layer[l_tgt]
-                        ln_module = layer_module.layernorm_before
-
-                        current_resid_input = None
-                        if (v in resids_pre_attention):
-                            current_resid_input = resids_pre_attention[v]
-                        else:
-                            current_resid_input = ln_module.input
-                        corrected_post_ln = ln_module(current_resid_input + steering)
-                        current_post_ln = ln_module(current_resid_input)  # OR ln_module.output if available
-
-                        delta_post_ln = corrected_post_ln - current_post_ln
-
-                        start = h_tgt * head_dim
-                        end = (h_tgt + 1) * head_dim
-
-                        if head_type == "<q>":
-                            W_Q = layer_module.attention.attention.query.weight
-                            delta_q = delta_post_ln @ W_Q.T
-                            layer_module.attention.attention.query.output[:, :, start:end] += delta_q[:, :, start:end]
-                        if head_type == "<k>":
-                            W_K = layer_module.attention.attention.key.weight
-                            delta_k = delta_post_ln @ W_K.T
-                            layer_module.attention.attention.key.output[:, :, start:end] += delta_k[:, :, start:end]
-                        if head_type == "<v>":
-                            W_V = layer_module.attention.attention.value.weight
-                            delta_v = delta_post_ln @ W_V.T
-                            layer_module.attention.attention.value.output[:, :, start:end] += delta_v[:, :, start:end]
-
-                    elif v.startswith("m"):
-                        l_tgt = int(v[1:])
-                        model_nnsight.vit.encoder.layer[l_tgt].layernorm_after.input += steering
-
-                    if (v not in resids_pre_attention):
-                        if v_layer < n_layers:
-                            resids_pre_attention[v] = model_nnsight.vit.encoder.layer[v_layer].layernorm_before.input + steering
-                        else:
-                            resids_pre_attention[v] = model_nnsight.vit.layernorm.input + steering
+                    current_resid_input = None
+                    if (v in resids_pre_attention):
+                        current_resid_input = resids_pre_attention[v]
                     else:
-                        resids_pre_attention[v] = resids_pre_attention[v] + steering
+                        current_resid_input = ln_module.input
+                    corrected_post_ln = ln_module(current_resid_input + steering)
+                    current_post_ln = ln_module(current_resid_input)  # OR ln_module.output if available
 
-                patched_logits = model_nnsight.classifier.output
+                    delta_post_ln = corrected_post_ln - current_post_ln
 
-                patched_loss = metric(patched_logits, target_batch).save()
-            metric_cache.append(patched_loss.value.item())
+                    start = h_tgt * head_dim
+                    end = (h_tgt + 1) * head_dim
 
-        return np.mean(metric_cache), np.array(metric_cache)
+                    if head_type == "<q>":
+                        W_Q = layer_module.attention.attention.query.weight
+                        delta_q = delta_post_ln @ W_Q.T
+                        layer_module.attention.attention.query.output[:, :, start:end] += delta_q[:, :, start:end]
+                    if head_type == "<k>":
+                        W_K = layer_module.attention.attention.key.weight
+                        delta_k = delta_post_ln @ W_K.T
+                        layer_module.attention.attention.key.output[:, :, start:end] += delta_k[:, :, start:end]
+                    if head_type == "<v>":
+                        W_V = layer_module.attention.attention.value.weight
+                        delta_v = delta_post_ln @ W_V.T
+                        layer_module.attention.attention.value.output[:, :, start:end] += delta_v[:, :, start:end]
+
+                elif v.startswith("m"):
+                    l_tgt = int(v[1:])
+                    model_nnsight.vit.encoder.layer[l_tgt].layernorm_after.input += steering
+
+                if (v not in resids_pre_attention):
+                    if v_layer < n_layers:
+                        resids_pre_attention[v] = model_nnsight.vit.encoder.layer[
+                                                      v_layer].layernorm_before.input + steering
+                    else:
+                        resids_pre_attention[v] = model_nnsight.vit.layernorm.input + steering
+                else:
+                    resids_pre_attention[v] = resids_pre_attention[v] + steering
+
+            if measure_at_logit == "out":
+                patched_logits = model_nnsight.classifier.output.save()
+                patched_loss = metric(patched_logits).save()
+            elif measure_at_logit == "in":
+                corrupted_classifier_input = model_nnsight.vit.layernorm.input.save()
+                patched_loss = metric(clean_classifier_act, corrupted_classifier_input).save()
+        metric_cache.append(patched_loss.value.item())
+
+        return np.mean(metric_cache)
+
 
     @staticmethod
     def maximize_edge_effect_on_metric(model, clean_input, edge, targets,
