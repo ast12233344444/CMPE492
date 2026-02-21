@@ -1,3 +1,6 @@
+import json
+
+import numpy as np
 from tqdm import tqdm
 import torch.nn.functional as F
 import torch
@@ -151,6 +154,62 @@ def train_sae(model, train_loader, test_loader, l1_coeff, epochs=100):
         print(f"\nEpoch {epoch + 1} Summary:")
         print(f"  Train -> MSE: {total_mse / batch_count:.6f} | L1: {total_l1 / batch_count:.4f}")
         print(f"  Test  -> MSE: {test_mse:.6f} | L1: {test_l1:.4f} | L0: {test_l0:.1f}")
+
+def extract_feature_stats(SAE, dataloader, out_path):
+    # Things to store featurewise
+    # Nonzero Mean
+    # Nonzero 0.99th q.
+    # Nonzero 0.999th q.
+    # Nonzero Max
+    # same on l2 norm of residual
+
+    feature_means_nz = []
+    feature_99_nz = []
+    feature_999_nz = []
+    feature_maxs = []
+
+    nonzero_acts = [np.array([]) for _ in range(SAE.hidden_dim)]
+    resid_norms = np.array([])
+
+    with torch.no_grad():
+        for batch in dataloader:
+            encoded, decoded = SAE(batch)
+            for hidden_idx in range(SAE.hidden_dim):
+                slice = encoded[:, hidden_idx].detach().cpu().numpy()
+                nonzero_acts[hidden_idx] = np.concatenate((nonzero_acts[hidden_idx], slice[slice > 0]))
+            batch_resid_norms = torch.norm(batch - decoded, p=2, dim=1).detach().cpu().numpy()
+            resid_norms = np.concatenate((resid_norms, batch_resid_norms))
+
+    for hidden_idx in range(SAE.hidden_dim):
+        if len(nonzero_acts[hidden_idx]) > 0:
+            feature_means_nz.append(float(np.mean(nonzero_acts[hidden_idx])))
+            feature_99_nz.append(float(np.quantile(nonzero_acts[hidden_idx], 0.99)))
+            feature_999_nz.append(float(np.quantile(nonzero_acts[hidden_idx], 0.999)))
+            feature_maxs.append(float(np.max(nonzero_acts[hidden_idx])))
+        else:
+            feature_means_nz.append(0)
+            feature_99_nz.append(0)
+            feature_999_nz.append(0)
+            feature_maxs.append(0)
+
+    resid_l2_means = float(np.mean(resid_norms))
+    resid_l2_99 = float(np.quantile(resid_norms, 0.99))
+    resid_l2_999 = float(np.quantile(resid_norms, 0.999))
+    resid_l2_max = float(np.max(resid_norms))
+
+    out_dict = {
+        "feature_means_nz": feature_means_nz,
+        "feature_99_nz": feature_99_nz,
+        "feature_999_nz": feature_999_nz,
+        "feature_maxs": feature_maxs,
+        "resid_l2_mean": resid_l2_means,
+        "resid_l2_99": resid_l2_99,
+        "resid_l2_999": resid_l2_99,
+        "resid_l2_max": resid_l2_max,
+    }
+
+    with open(out_path, "w") as f:
+        json.dump(out_dict, f)
 
 if __name__ == "__main__":
     # Create a directory for saved models if it doesn't exist

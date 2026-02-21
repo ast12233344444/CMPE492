@@ -39,9 +39,6 @@ def save_all_activations(model, loader, directory, node, type):
     n_heads = model.config.num_attention_heads
     head_dim = model.config.hidden_size // n_heads
 
-
-    # 3. Size Tracking and Chunking Variables
-    # 900 MB limit leaves a safe margin so we strictly remain < 1GB
     act_buffer = []
     file_counter = 0
 
