@@ -6,59 +6,6 @@ from PIL import Image
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-class DataSetups:
-    @staticmethod
-    def generate_pairwise_dataset(data_path, processor, true_label, distorted_label):
-        path_clean = os.path.join(data_path, true_label, true_label)
-        path_corrupted = os.path.join(data_path, true_label, distorted_label)
-        files_clean = os.listdir(path_clean)
-        files_corrupted = os.listdir(path_corrupted)
-        dpoints_clean = []
-        dpoints_adversarial = []
-        for file in files_clean:
-            dpoint_clean = Image.open(os.path.join(path_clean, file)).convert("RGB")
-            dpoints_clean.append(dpoint_clean)
-            dpoint_adversarial = Image.open(os.path.join(path_corrupted, file)).convert("RGB")
-            dpoints_adversarial.append(dpoint_adversarial)
-
-        input_adversarial = processor(images=dpoints_adversarial, return_tensors="pt")["pixel_values"].to(device)
-        input_clean = processor(images=dpoints_clean, return_tensors="pt")["pixel_values"].to(device)
-
-        return input_clean, input_adversarial
-
-    @staticmethod
-    def generate_transformed_dataset(data_path, processor, classes, transform_function):
-        dpoints_clean = []
-        dpoints_transformed = []
-
-        # Iterate through the provided list of class directories
-        for class_name in classes:
-            class_path = os.path.join(data_path, class_name, class_name)
-
-            # Skip if the directory doesn't exist
-            if not os.path.isdir(class_path):
-                continue
-
-            files = os.listdir(class_path)
-
-            for file in files:
-                # Ensure we are only reading PNG images
-                if file.lower().endswith('.png'):
-                    img_path = os.path.join(class_path, file)
-
-                    # 1. Read clean image
-                    dpoint_clean = Image.open(img_path).convert("RGB")
-                    dpoints_clean.append(dpoint_clean)
-
-                    # 2. Apply the provided transformation function
-                    dpoint_transformed = transform_function(dpoint_clean)
-                    dpoints_transformed.append(dpoint_transformed)
-
-        input_clean = processor(images=dpoints_clean, return_tensors="pt")["pixel_values"].to(device)
-        input_transformed = processor(images=dpoints_transformed, return_tensors="pt")["pixel_values"].to(device)
-
-        return input_clean, input_transformed
-
 class TargetCorruptedImageDataset(Dataset):
     def __init__(self, data_path, processor, true_label, distorted_label, offset = 0):
         self.offset = offset
@@ -122,3 +69,29 @@ class TransformedImageDataset(Dataset):
         input_transformed = self.processor(images=dpoint_transformed, return_tensors="pt")["pixel_values"].squeeze(0)
 
         return input_clean, input_transformed
+
+class SingleClassCleanDataset(Dataset):
+    def __init__(self, data_path, processor, class_name):
+        self.processor = processor
+        self.image_paths = []
+
+        class_path = os.path.join(data_path, class_name, class_name)
+
+        if not os.path.isdir(class_path):
+            return
+
+        for file in os.listdir(class_path):
+            if file.lower().endswith('.png'):
+                self.image_paths.append(os.path.join(class_path, file))
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        img_path = self.image_paths[idx]
+
+        dpoint_clean = Image.open(img_path).convert("RGB")
+
+        input_clean = self.processor(images=dpoint_clean, return_tensors="pt")["pixel_values"].squeeze(0)
+
+        return input_clean

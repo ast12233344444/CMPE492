@@ -42,7 +42,7 @@ def save_all_activations(model, loader, directory, node, type):
     act_buffer = []
     file_counter = 0
 
-    print(f"Starting extraction. Saving to '{output_dir}/' in chunks < 1GB...")
+    print(f"Starting extraction. Saving to '{directory}/' in chunks < 1GB...")
 
     with torch.no_grad():
         for i, (pixel_values, labels) in enumerate(tqdm(loader, desc="Extracting Activations")):

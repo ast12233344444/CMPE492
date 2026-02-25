@@ -37,10 +37,10 @@ class Experiment:
 
                 # --- 1. Base Model Pass ---
                 # Safely handle raw HF models returning a sequence classifier output
-                base_clean_logits = base_model(clean_inputs)
+                base_clean_logits = base_model(clean_inputs).logits
                 #base_clean_logits = base_clean_out
 
-                base_adv_logits = base_model(adv_inputs)
+                base_adv_logits = base_model(adv_inputs).logits
                 #base_adv_logits = base_adv_out.logits if hasattr(base_adv_out, 'logits') else base_adv_out
 
                 # --- 2. Proposed Model Pass (LatentClippedViT) ---

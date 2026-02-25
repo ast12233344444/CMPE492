@@ -20,27 +20,54 @@ class SAE_propogatefunctions:
     def cut_above_max(hidden_state, train_activation_stats, SAE_model):
         """
         Passes the hidden state through the SAE, clips the latent activations and
-        the residual error to their maximum training values, and reconstructs the state.
+        the residual error to their target training values, enforces an L0 norm limit,
+        and reconstructs the state.
         """
         SAE_model.eval()
 
         encoded, decoded = SAE_model(hidden_state)
-
         device = hidden_state.device
 
-        feature_maxs = torch.tensor(train_activation_stats["feature_maxs"], device=device)
-        encoded_clipped = torch.clamp(encoded, max=feature_maxs)
+        # 1. Feature-wise Value Clipping
+        # (You are currently using 'feature_means_nz', which is very aggressive!
+        # Consider 'feature_99_nz' if accuracy drops too much on clean data)
+        feature_ceilings = torch.tensor(train_activation_stats["feature_means_nz"], device=device)
+        encoded_clipped = torch.clamp(encoded, max=feature_ceilings)
 
+        # 2. L0 Norm Clipping (Keep only Top-K activations)
+        # Fetch the L0 threshold from the stats we added earlier
+        # 2. L0 Norm Clipping (Keep only Top-K activations)
+        max_l0 = int(train_activation_stats.get("l0_mean", SAE_model.hidden_dim))
+
+        if max_l0 < SAE_model.hidden_dim and max_l0 > 0:
+            # 1. Assign the single Proxy object to a variable
+            topk_result = torch.topk(encoded_clipped, k=max_l0, dim=-1)
+
+            # 2. Extract values and indices from the Proxy attributes
+            topk_vals = topk_result.values
+            topk_indices = topk_result.indices
+
+            # Create a blank canvas of zeros
+            encoded_pruned = torch.zeros_like(encoded_clipped)
+
+            # 3. Use the out-of-place .scatter() method instead of .scatter_()
+            encoded_pruned = encoded_pruned.scatter(dim=-1, index=topk_indices, src=topk_vals)
+
+            # Overwrite encoded_clipped with our newly pruned version
+            encoded_clipped = encoded_pruned
+
+        # 3. Decode the clipped & pruned activations
         decoded_clipped = F.linear(encoded_clipped, SAE_model.W_dec.t()) + SAE_model.b_dec
 
+        # 4. Residual Clipping
         residual = hidden_state - decoded
-
         resid_norm = torch.norm(residual, p=2, dim=-1, keepdim=True)
-        max_resid_norm = train_activation_stats["resid_l2_max"]
+        max_resid_norm = train_activation_stats["resid_l2_mean"]
 
         scale_factor = torch.clamp(max_resid_norm / (resid_norm + 1e-8), max=1.0)
         residual_clipped = residual * scale_factor
 
+        # 5. Reconstruct the final hidden state
         transformed_hidden_state = decoded_clipped + residual_clipped
 
         return transformed_hidden_state
@@ -67,8 +94,9 @@ class LatentClippedViT(nn.Module):
             with self.model.trace(img):
                 if "input" in self.structs_to_clip:
                     hidden_states = TracingAlgorithms._get_activations(self.model, "input", head_dim)
-                    transformed_hidden_states = self.propogate_func(hidden_states, self.train_act_stats["input"], self.SAE_models["input"])
-                    TracingAlgorithms._set_activations(self.model, "input", transformed_hidden_states)
+                    #HERE i suspect propogate_func does nothing.
+                    transformed_hidden_states= self.propogate_func(hidden_states, self.train_act_stats["input"], self.SAE_models["input"])
+                    TracingAlgorithms._set_activations(self.model, "input", head_dim, transformed_hidden_states)
 
                 for layer in range(n_layers):
                     for head in range(n_heads):
@@ -77,13 +105,13 @@ class LatentClippedViT(nn.Module):
                             transformed_hidden_states = self.propogate_func(hidden_states,
                                                                             self.train_act_stats[f"a{layer}.h{head}"],
                                                                             self.SAE_models[f"a{layer}.h{head}"])
-                            TracingAlgorithms._set_activations(self.model, f"a{layer}.h{head}", transformed_hidden_states)
+                            TracingAlgorithms._set_activations(self.model, f"a{layer}.h{head}", head_dim, transformed_hidden_states)
 
                     if f"m{layer}" in self.structs_to_clip:
                         hidden_states = TracingAlgorithms._get_activations(self.model, f"m{layer}", head_dim)
                         transformed_hidden_states = self.propogate_func(hidden_states, self.train_act_stats[f"m{layer}"],
                                                                         self.SAE_models[f"m{layer}"])
-                        TracingAlgorithms._set_activations(self.model, f"m{layer}", transformed_hidden_states)
+                        TracingAlgorithms._set_activations(self.model, f"m{layer}", head_dim, transformed_hidden_states)
                 outputs = self.model.classifier.output.save()
         else:
             raise NotImplementedError
@@ -106,7 +134,7 @@ if __name__ == "__main__":
     true_class = 0
     adversarial_class = 1
     l1_coeffs = [1e-4]
-    sparsities = [4, 8, 16, 32]
+    sparsities = [8, 16, 32]
     nodes = ["input", "m11"]
     dataset = TargetCorruptedImageDataset(data_path, processor, classes[true_class], classes[adversarial_class])
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=8, shuffle=True)
@@ -114,33 +142,36 @@ if __name__ == "__main__":
     for l1_coeff in l1_coeffs:
         for sparsity in sparsities:
             for node in nodes:
-                act_stats = json.load(open(os.path.join(act_stats_dir, f"sae_{node}_ef{sparsity}_l1{l1_coeff}.json")))
+                for true_class in range(len(classes)):
+                    for adversarial_class in range(len(classes)):
+                        act_stats = {}
+                        act_stats[node] = json.load(open(os.path.join(act_stats_dir, f"sae_{node}_ef{sparsity}_l1{l1_coeff}.json")))
 
-                # 2. Construct path to the saved PyTorch model
-                sae_model_path = os.path.join(sae_models_dir, f"sae_{node}_ef{sparsity}_l1{l1_coeff}.pt")
+                        # 2. Construct path to the saved PyTorch model
+                        sae_model_path = os.path.join(sae_models_dir, f"sae_{node}_ef{sparsity}_l1{l1_coeff}.pt")
 
-                # 3. Load the checkpoint dictionary (map to CPU first, then device to be safe)
-                checkpoint = torch.load(sae_model_path, map_location=device)
+                        # 3. Load the checkpoint dictionary (map to CPU first, then device to be safe)
+                        checkpoint = torch.load(sae_model_path, map_location=device)
 
-                # 4. Initialize the SAE architecture using saved dimensions
-                SAE_model = SparseAutoencoder(
-                    input_dim=checkpoint['input_dim'],
-                    expansion_factor=checkpoint['expansion_factor']
-                ).to(device)
+                        # 4. Initialize the SAE architecture using saved dimensions
+                        SAE_model = SparseAutoencoder(
+                            input_dim=checkpoint['input_dim'],
+                            expansion_factor=checkpoint['expansion_factor']
+                        ).to(device)
 
-                # 5. Load the trained weights and set to eval mode
-                SAE_model.load_state_dict(checkpoint['model_state_dict'])
-                SAE_model.eval()
+                        # 5. Load the trained weights and set to eval mode
+                        SAE_model.load_state_dict(checkpoint['model_state_dict'])
+                        SAE_model.eval()
 
-                clipping_Vit = LatentClippedViT(model, SAE_propogatefunctions.cut_above_max,
-                                    train_act_stats=act_stats, structs_to_clip = [node], SAE_models = {node: SAE_model})
+                        clipping_Vit = LatentClippedViT(model, SAE_propogatefunctions.cut_above_max,
+                                            train_act_stats=act_stats, structs_to_clip = [node], SAE_models = {node: SAE_model})
 
 
-                print("="*25, f"performances {classes[true_class]}=>{classes[adversarial_class]}, with SAE {node} {sparsity} {l1_coeff}", "="*25)
-                results = Experiment.compare_model_performances(base_model, clipping_Vit, dataloader, true_class, device=device)
+                        print("="*25, f"performances {classes[true_class]}=>{classes[adversarial_class]}, with SAE {node} {sparsity} {l1_coeff}", "="*25)
+                        results = Experiment.compare_model_performances(base_model, clipping_Vit, dataloader, true_class, device=device)
 
-                save_path = os.path.join(plot_save_path, f"{classes[true_class]}=>{classes[adversarial_class]}_SAE_{node}_{sparsity}_l1{l1_coeff}.pt")
-                Experiment.plot_and_save_comparison(results, save_path)
+                        save_path = os.path.join(plot_save_path, f"{classes[true_class]}=>{classes[adversarial_class]}_SAE_{node}_{sparsity}_l1{l1_coeff}.png")
+                        Experiment.plot_and_save_comparison(results, save_path)
 
 
 

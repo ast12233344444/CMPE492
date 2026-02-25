@@ -65,6 +65,12 @@ class TracingAlgorithms:
             head_z = concat_heads[:, :, start:end]
             W_O_head = W_O[:, start:end]
             clean_activations = (head_z @ W_O_head.T).save()
+        elif u.startswith("lnb"):
+            layer_idx = int(u[3:])
+            layer_module = model_ref.vit.encoder.layer[layer_idx]
+            clean_activations = layer_module.layernorm_before.output.save()
+        else:
+            raise NotImplementedError
         return clean_activations
 
     @staticmethod
