@@ -253,6 +253,7 @@ def extract_feature_stats(SAE, dataloader, out_path, max_samples=100_000):
         json.dump(out_dict, f)
 
 if __name__ == "__main__":
+    project_dir = os.getcwd()
     # Create a directory for saved models if it doesn't exist
     model_id = 'nateraw/vit-base-patch16-224-cifar10'
     processor = ViTImageProcessor.from_pretrained(model_id)
@@ -267,7 +268,7 @@ if __name__ == "__main__":
     dataset = datasets.CIFAR10(root='./data', train=True, download=True)
     loader_train_img = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
 
-    save_dir = "/home/ahmet/PycharmProjects/CMPE492/saved_models"
+    save_dir = f"{project_dir}/saved_models"
     os.makedirs(save_dir, exist_ok=True)
     train = True
     export_act = True
@@ -283,7 +284,7 @@ if __name__ == "__main__":
 
     if train:
         for node in nodes:
-            base_path = f"/home/ahmet/PycharmProjects/CMPE492/model_activations"
+            base_path = f"{project_dir}/model_activations"
             save_all_activations(model, loader_train_img, base_path, node, "train")
             save_all_activations(model, loader_test_img, base_path, node, "test")
             for expansion_factor in expansion_factors:
@@ -310,7 +311,7 @@ if __name__ == "__main__":
                 }, save_path)
 
                 if export_act:
-                    act_stats_dir = "/home/ahmet/PycharmProjects/CMPE492/model_activation_stats"
+                    act_stats_dir = f"{project_dir}/model_activation_stats"
                     out_path = os.path.join(act_stats_dir, f"sae_{node}_ef{expansion_factor}_l1{l1_coefficient}.json")
                     extract_feature_stats(SAE_model, train_loader, out_path)
 
