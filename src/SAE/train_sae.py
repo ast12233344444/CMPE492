@@ -269,7 +269,7 @@ if __name__ == "__main__":
 
     save_dir = "/home/ahmet/PycharmProjects/CMPE492/saved_models"
     os.makedirs(save_dir, exist_ok=True)
-    train = False
+    train = True
     export_act = True
 
     # 1. Hyperparameters
@@ -317,7 +317,7 @@ if __name__ == "__main__":
                 print(f"Model saved successfully to {save_path}")
             shutil.rmtree(f"{base_path}/{node}")
 
-    if export_act:
+    """if export_act:
         for expansion_factor in expansion_factors:
             for node in nodes:
                 base_path = f"/home/ahmet/PycharmProjects/CMPE492/model_activations/{node}"
@@ -330,4 +330,4 @@ if __name__ == "__main__":
                 out_path = os.path.join(act_stats_dir, f"sae_{node}_ef{expansion_factor}_l1{l1_coefficient}.json")
 
                 print(f"extracting... to {out_path}")
-                extract_feature_stats(SAE_model, train_loader, out_path)
+                extract_feature_stats(SAE_model, train_loader, out_path)"""
