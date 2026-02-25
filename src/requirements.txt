@@ -23,4 +23,3 @@ networkx
 typeguard
 torchtyping
 plotly
-pygraphviz
