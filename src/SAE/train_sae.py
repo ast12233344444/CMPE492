@@ -312,6 +312,7 @@ if __name__ == "__main__":
 
                 if export_act:
                     act_stats_dir = f"{project_dir}/model_activation_stats"
+                    os.makedirs(act_stats_dir, exist_ok=True)
                     out_path = os.path.join(act_stats_dir, f"sae_{node}_ef{expansion_factor}_l1{l1_coefficient}.json")
                     extract_feature_stats(SAE_model, train_loader, out_path)
 
