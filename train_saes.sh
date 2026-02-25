@@ -8,6 +8,7 @@ cd /users/ahmet.turkel/CMPE492
 rm -rf .venv
 python -m venv .venv
 source .venv/bin/activate
+PIP_USER=true
 pip install --upgrade pip
 pip install -r src/requirements.txt
 
