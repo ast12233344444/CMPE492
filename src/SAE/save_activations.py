@@ -24,7 +24,7 @@ def add_data_points(model, pixel_values, node, head_dim, to_array):
     with model.trace(pixel_values):
         hidden_states = TracingAlgorithms._get_activations(model, node, head_dim)
 
-    activation = hidden_states.detach().cpu().clone().contiguous()
+    activation = hidden_states.detach().cpu().contiguous()
 
     to_array.append(activation)
 

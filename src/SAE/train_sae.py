@@ -253,7 +253,7 @@ def extract_feature_stats(SAE, dataloader, out_path, max_samples=100_000):
         json.dump(out_dict, f)
 
 if __name__ == "__main__":
-    project_dir = os.getcwd()
+    project_dir = "/home/ahmet/PycharmProjects/CMPE492"#os.getcwd()
     # Create a directory for saved models if it doesn't exist
     model_id = 'nateraw/vit-base-patch16-224-cifar10'
     processor = ViTImageProcessor.from_pretrained(model_id)
@@ -261,7 +261,7 @@ if __name__ == "__main__":
     hf_model.eval()
     model = NNsight(hf_model)
 
-    batch_size = 8
+    batch_size = 256
     dataset = datasets.CIFAR10(root='./data', train=False, download=True)
     loader_test_img = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
 
@@ -278,9 +278,9 @@ if __name__ == "__main__":
     input_dim = 768  # ViT-Base hidd                                                                        en dim
     expansion_factors = [8]
     l1_coefficient = 1e-4  # Adjust lambda based on target sparsity (L0)
-    batch_size = 4096  # SAEs benefit from large batches
+    batch_size = 2**15  # SAEs benefit from large batches
     learning_rate = 3e-4
-    nodes = ["lnb1"]#f"lnb{i}" for i in range(n_attention_layers)]
+    nodes = [f"lnb{i}" for i in range(11, 1, -1)]#f"lnb{i}" for i in range(n_attention_layers)]
 
     if train:
         for node in nodes:
