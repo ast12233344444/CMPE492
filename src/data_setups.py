@@ -85,7 +85,7 @@ class SingleClassCleanDataset(Dataset):
                 self.image_paths.append(os.path.join(class_path, file))
 
     def __len__(self):
-        return 16 #len(self.image_paths)
+        return len(self.image_paths)
 
     def __getitem__(self, idx):
         img_path = self.image_paths[idx]

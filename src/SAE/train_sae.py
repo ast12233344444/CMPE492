@@ -276,11 +276,11 @@ if __name__ == "__main__":
     # 1. Hyperparameters
     n_attention_layers = model.config.num_hidden_layers
     input_dim = 768  # ViT-Base hidd                                                                        en dim
-    expansion_factors = [8]
+    expansion_factors = [16]
     l1_coefficient = 1e-4  # Adjust lambda based on target sparsity (L0)
-    batch_size = 2**15  # SAEs benefit from large batches
+    batch_size = 2**14  # SAEs benefit from large batches
     learning_rate = 3e-4
-    nodes = [f"lnb{i}" for i in range(11, 1, -1)]#f"lnb{i}" for i in range(n_attention_layers)]
+    nodes = [f"lnb{i}" for i in range(10, -1, -1)]#f"lnb{i}" for i in range(n_attention_layers)]
 
     if train:
         for node in nodes:

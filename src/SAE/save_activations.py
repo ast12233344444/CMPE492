@@ -50,7 +50,7 @@ def save_all_activations(model, loader, directory, node, type):
 
             elsize = math.prod(act_buffer[0].size())
 
-            # If adding this batch exceeds our 900MB limit, save the buffer to disk
+            # If adding this batch exceeds our 90x"0MB limit, save the buffer to disk
             if len(act_buffer) * elsize > 2 ** 28:
                 chunk_activations = torch.cat(act_buffer, dim=0)
 
@@ -85,14 +85,14 @@ if __name__ == "__main__":
     model_nnsight = NNsight(hf_model)
 
     batch_size = 8
-    dataset = datasets.CIFAR10(root='./data', train=False, download=True)
+    dataset = datasets.CIFAR10(root='/home/ahmet/PycharmProjects/CMPE492/data', train=False, download=True)
     loader_test = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
 
 
-    dataset = datasets.CIFAR10(root='./data', train=True, download=True)
+    dataset = datasets.CIFAR10(root='/home/ahmet/PycharmProjects/CMPE492/data', train=True, download=True)
     loader_train = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
 
-    nodes = ["input", "m11"]
+    nodes = ["m11"]
 
     for node in nodes:
         save_all_activations(model_nnsight, loader_train, output_dir, node, "train")
