@@ -17,28 +17,28 @@ from src.TracingAlgorithms import TracingAlgorithms
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-class StyleGAN2_Z_Wrapper(nn.Module):
+class NVIDIA_StyleGAN2_Z_Wrapper(nn.Module):
     def __init__(self, generator_model, device="cuda"):
-        """
-        Wraps a pretrained PyTorch StyleGAN2 generator for native z-space optimization.
-        """
         super().__init__()
         self.model = generator_model.to(device)
         self.model.eval()
-        self.model.requires_grad_(False)  # Freeze the generator completely
+        self.model.requires_grad_(False)
+
+        # NVIDIA StyleGAN2 requires a class label 'c'.
+        # For unconditional models, 'c_dim' is 0, meaning it just needs an empty tensor.
+        self.c_dim = self.model.c_dim
 
     def forward(self, z_latents):
-        """
-        z_latents shape: [batch_size, 512]
-        """
-        # input_is_latent=False forces the model to pass z through the Mapping Network
-        image, _ = self.model(
-            [z_latents],
-            input_is_latent=False,
-            randomize_noise=False
-        )
+        batch_size = z_latents.shape[0]
+        device = z_latents.device
 
-        # StyleGAN outputs roughly in [-1, 1], shift to standard [0, 1] range
+        # Create the dummy class vector
+        c = torch.zeros([batch_size, self.c_dim], device=device)
+
+        # Forward pass: noise_mode='const' ensures deterministic output without high-frequency jitter
+        image = self.model(z_latents, c, truncation_psi=1.0, noise_mode='const')
+
+        # Shift [-1, 1] to standard [0, 1] range for ViT normalization
         image = (image + 1.0) / 2.0
         return image.clamp(0, 1)
 
@@ -196,99 +196,85 @@ def maximize_sae_feature_with_generator(
     return final_images
 
 
-def steer_feature_with_vae(
+def maximize_sae_feature_with_stylegan_z(
         model,
         sae_model,
-        vae_model,
-        starting_image,
+        generator,
         layer_node,
         feature_idx,
-        iterations=150,
+        latent_dim=512,  # Standard StyleGAN z dimension
+        iterations=200,
         lr=0.05,
-        lambda_preserve=1.0,
-        target_token_idx=None
+        target_token_idx=None,
+        num_images=5
 ):
-    model.eval()
-    sae_model.eval()
+    """
+    Maximizes an SAE feature by optimizing a batch of tensors in StyleGAN's native z space.
+    """
+    device = next(model.parameters()).device
 
-    # 1. ViT ImageNet normalization parameters
+    # 1. Initialize learnable z vector (Standard Normal Distribution)
+    # Shape: [num_images, latent_dim] -> No layer dimension needed for pure z!
+    latent_param = torch.nn.Parameter(torch.randn((num_images, latent_dim), device=device))
+    optimizer = torch.optim.Adam([latent_param], lr=lr)
+
+    # ViT ImageNet/CIFAR normalization parameters
     mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
     std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
 
-    starting_image = starting_image.to(device)
-
-    # 2. Extract original SAE features to act as our anchor
-    with torch.no_grad():
-        orig_input = (starting_image - mean) / std
-        outputs = model(pixel_values=orig_input, output_hidden_states=True)
-
-        if layer_node.startswith("lnb"):
-            layer_idx = int(layer_node[3:])
-            layer_input = outputs.hidden_states[layer_idx]
-            orig_activations = model.vit.encoder.layer[layer_idx].layernorm_before(layer_input)
-        else:
-            raise NotImplementedError("Native extraction for this node not implemented.")
-
-        orig_encoded, _ = sae_model(orig_activations)
-        orig_encoded = orig_encoded.detach()
-
-        # 3. Get the starting latent vector from the VAE
-        initial_latent = vae_model.encode(starting_image)
-
-    # 4. Make the latent vector learnable
-    latent_param = torch.nn.Parameter(initial_latent.clone())
-    optimizer = torch.optim.Adam([latent_param], lr=lr)
-
-    # Create a mask to zero-out the target feature from the MSE preservation loss
-    mask = torch.ones_like(orig_encoded)
-    mask[:, :, feature_idx] = 0.0
-
-    pbar = tqdm(range(iterations), desc=f"VAE Steering F{feature_idx}")
+    pbar = tqdm(range(iterations), desc=f"Z-Space Optimization for Feature {feature_idx}")
     for _ in pbar:
         optimizer.zero_grad()
 
-        # 5. Decode latent to current image
-        current_image = vae_model.decode(latent_param)
+        # 2. Forward pass through StyleGAN
+        generated_image = generator(latent_param)
 
-        # 6. Pass through ViT
-        model_input = (current_image - mean) / std
+        # 3. Interpolate and normalize for the ViT
+        generated_image_resized = F.interpolate(
+            generated_image, size=(224, 224), mode='bilinear', align_corners=False
+        )
+        model_input = (generated_image_resized - mean) / std
+
+        # 4. Pure PyTorch Forward Pass (Bypassing NNsight)
         outputs = model(pixel_values=model_input, output_hidden_states=True)
 
-        layer_input = outputs.hidden_states[layer_idx]
-        activations = model.vit.encoder.layer[layer_idx].layernorm_before(layer_input)
-
-        current_encoded, _ = sae_model(activations)
-
-        # 7. Calculate Losses
-        if target_token_idx is not None:
-            feature_act = current_encoded[:, target_token_idx, feature_idx]
+        # Extract target node activations natively
+        if layer_node.startswith("lnb"):
+            layer_idx = int(layer_node[3:])
+            layer_input = outputs.hidden_states[layer_idx]
+            activations = model.vit.encoder.layer[layer_idx].layernorm_before(layer_input)
         else:
-            feature_act = current_encoded[:, :, feature_idx].sum(dim=1)
+            raise NotImplementedError(f"Native extraction for {layer_node} not yet implemented.")
 
-        loss_maximize = -feature_act.mean()
+        # 5. Pass through the SAE to get features
+        encoded, _ = sae_model(activations)
 
-        #if -loss_maximize > 10 * orig_encoded[:, :, feature_idx].sum(dim=1).mean():
-        #    break
+        # 6. Isolate the target feature across the sequence
+        if target_token_idx is not None:
+            feature_act = encoded[:, target_token_idx, feature_idx]
+        else:
+            feature_act = encoded[:, :, feature_idx].sum(dim=1)
 
-        # Multiply both by the mask so the target feature doesn't penalize the MSE
-        loss_preserve = F.mse_loss(current_encoded * mask, orig_encoded * mask)
+        # --- LOSSES ---
+        loss_max = -feature_act.mean()
 
-        # Combine and backpropagate
-        total_loss = loss_maximize + (lambda_preserve * loss_preserve)
+        # Pull z back towards a standard normal distribution
+        l2_penalty = torch.norm(latent_param, p=2, dim=-1).mean()
+
+        # 0.01 is a good starting weight; increase it if the images look deep-fried
+        total_loss = loss_max + (0.01 * l2_penalty)
+
+        # Backpropagate
         total_loss.backward()
-
         optimizer.step()
 
-        pbar.set_postfix({
-            "max_act": f"{-loss_maximize.item():.2f}",
-            "mse_pres": f"{loss_preserve.item():.4f}"
-        })
+        pbar.set_postfix({"act": f"{-loss_max.item():.2f}", "l2": f"{l2_penalty.item():.2f}"})
 
-    # Return the final modified image
+    # Return the optimized batch of images
     with torch.no_grad():
-        optimized_image = vae_model.decode(latent_param).detach()
+        final_images = generator(latent_param).detach()
 
-    return optimized_image
+    return final_images
 
 
 """if __name__ == "__main__":
@@ -350,6 +336,98 @@ def steer_feature_with_vae(
     print(f"Saved original and steered images to {save_dir}")"""
 
 if __name__ == "__main__":
+    import os
+    import sys
+    import pickle
+    import urllib.request
+    import torch
+    from torchvision.utils import save_image
+    from transformers import ViTImageProcessor, ViTForImageClassification
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # 1. Load ViT Model
+    model_id = 'nateraw/vit-base-patch16-224-cifar10'
+    hf_model = ViTForImageClassification.from_pretrained(model_id).to(device)
+    hf_model.eval()
+
+    # =====================================================================
+    # 2. AUTO-LOAD STYLEGAN2 FROM NVIDIA
+    # =====================================================================
+    # Clone the official repo if it doesn't exist in your directory
+    if not os.path.exists('stylegan2-ada-pytorch'):
+        print("Cloning official NVIDIA StyleGAN2 repository...")
+        os.system('git clone https://github.com/NVlabs/stylegan2-ada-pytorch.git')
+
+    # Insert repo into sys.path so Python can find the internal modules during unpickling
+    sys.path.insert(0, os.path.abspath('stylegan2-ada-pytorch'))
+
+    # Download unconditional AFHQ Cats weights (512x512 resolution)
+    weights_url = "https://nvlabs-fi-cdn.nvidia.com/stylegan2-ada-pytorch/pretrained/afhqcat.pkl"
+    weights_path = "afhqcat.pkl"
+
+    if not os.path.exists(weights_path):
+        print(f"Downloading StyleGAN2 weights to {weights_path}...")
+        urllib.request.urlretrieve(weights_url, weights_path)
+
+    print("Loading StyleGAN2 Generator...")
+    with open(weights_path, 'rb') as f:
+        # G_ema is the Exponential Moving Average generator (highest visual quality)
+        stylegan_model = pickle.load(f)['G_ema'].to(device)
+
+    # Wrap it for our z-space optimization
+    generator = NVIDIA_StyleGAN2_Z_Wrapper(stylegan_model, device=device)
+    # =====================================================================
+
+    # 3. Load your SAE
+    node_to_investigate = "lnb11"
+    expansion_factor = 16
+    l1_coeff = 1e-4
+    input_dim = 768
+
+    sae_path = f"/home/ahmet/PycharmProjects/CMPE492/saved_models/sae_{node_to_investigate}_ef{expansion_factor}_l1{l1_coeff}.pt"
+
+    sae_metadata = torch.load(sae_path, map_location=device)
+    SAE_model = SparseAutoencoder(input_dim=input_dim, expansion_factor=expansion_factor)
+    SAE_model.load_state_dict(sae_metadata['model_state_dict'])
+    SAE_model = SAE_model.to(device)
+    SAE_model.eval()
+
+    # 4. Run Optimization
+    feature_to_maximize = 12003
+    num_images_to_generate = 5
+
+    print(f"Maximizing global semantics for feature {feature_to_maximize} in {node_to_investigate}...")
+    # 5. Save the outputs into a common folder
+    save_dir = f"/home/ahmet/PycharmProjects/CMPE492/results/feature_vis_stylegan/{node_to_investigate}_f{feature_to_maximize}"
+    os.makedirs(save_dir, exist_ok=True)
+
+    for i in range(num_images_to_generate):
+        print(f"\n--- Generating Variation {i + 1}/{num_images_to_generate} ---")
+
+        # Free up memory from previous iterations
+        torch.cuda.empty_cache()
+
+        # Batch size of 1 avoids OOM
+        optimized_image_batch = maximize_sae_feature_with_stylegan_z(
+            model=hf_model,
+            sae_model=SAE_model,
+            generator=generator,
+            layer_node=node_to_investigate,
+            feature_idx=feature_to_maximize,
+            latent_dim=512,
+            iterations=150,
+            lr=0.05,
+            num_images=1  # <--- FIXED TO 1
+        )
+
+        # Save immediately
+        save_path = os.path.join(save_dir, f"variation_{i + 1:02d}.png")
+        save_image(optimized_image_batch[0], save_path)
+
+    print(f"\nSuccessfully saved {num_images_to_generate} optimized visualizations to {save_dir}")
+
+"""if __name__ == "__main__":
     # 1. Standard Setup
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model_id = 'nateraw/vit-base-patch16-224-cifar10'
@@ -406,4 +484,4 @@ if __name__ == "__main__":
         # optimized_images[i] pulls out the [3, 256, 256] tensor for the i-th image
         save_image(optimized_images[i], save_path)
 
-    print(f"Successfully saved {num_images_to_generate} optimized visualizations to {save_dir}")
+    print(f"Successfully saved {num_images_to_generate} optimized visualizations to {save_dir}")"""
