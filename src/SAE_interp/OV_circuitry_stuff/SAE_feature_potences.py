@@ -10,7 +10,6 @@ from torchvision import datasets
 from tqdm import tqdm
 from transformers import ViTImageProcessor, ViTForImageClassification
 
-from src.data_setups import SingleClassCleanDataset
 from src.SAE.train_sae import SparseAutoencoder
 from src.TracingAlgorithms import TracingAlgorithms
 
@@ -96,7 +95,7 @@ class FeaturePotences:
                     sum, n_data = out_data[clas][layer_key][head_key]
                     out_data[clas][layer_key][head_key] = (sum / n_data).tolist()
 
-        with open(f"/home/ahmet/PycharmProjects/CMPE492/results/feature_potence_calc.json", "w") as f:
+        with open(f"/results/feature_potence_calc.json", "w") as f:
             json.dump(out_data, f, indent=4)
 
     @staticmethod
@@ -163,12 +162,12 @@ class FeaturePotences:
                         class_presence_probs[clas][f"layer{layer_i}"][f"head{head_i}"] = (active_samples_in_class[layer_key].detach().cpu().numpy().astype(float) / tot_samples_in_class).tolist()
                         class_avg_attentions[clas][f"layer{layer_i}"][f"head{head_i}"] = (attention_sums_in_class[layer_key][head_i].detach().cpu().numpy().astype(float)
                                                                                           /  (active_samples_in_class[layer_key].detach().cpu().numpy().astype(float)+1e-6)).tolist()
-        with open(f"/home/ahmet/PycharmProjects/CMPE492/results/avg_attention_scores.json", "w") as f:
+        with open(f"/results/avg_attention_scores.json", "w") as f:
             json.dump({"class_presence_probs": class_presence_probs, "class_avg_attentions": class_avg_attentions}, f, indent=4)
 
 
 if __name__ == "__main__":
-    data_path = '/home/ahmet/PycharmProjects/CMPE492/pairwise_adv_dataset'
+    data_path = '/pairwise_adv_dataset'
     model_id = 'nateraw/vit-base-patch16-224-cifar10'
     processor = ViTImageProcessor.from_pretrained(model_id)
     model = ViTForImageClassification.from_pretrained(model_id, attn_implementation="eager").to(device)
@@ -180,8 +179,8 @@ if __name__ == "__main__":
     dataset = datasets.CIFAR10(root='./data', train=True, download=True)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
 
-    SAE_dir = "/home/ahmet/PycharmProjects/CMPE492/saved_models"
-    SAE_act_stats_dir = f"/home/ahmet/PycharmProjects/CMPE492/model_activation_stats"
+    SAE_dir = "/saved_models"
+    SAE_act_stats_dir = f"/model_activation_stats"
     saved_SAE_act_stats = os.listdir(SAE_act_stats_dir)
     SAEs = {}
     SAE_act_stats = {}

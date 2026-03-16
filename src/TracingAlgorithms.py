@@ -94,6 +94,12 @@ class TracingAlgorithms:
             W_O_head = W_O[:, start:end]
             clean_activations = (head_z @ W_O_head.T).save()
             layer_module.attention.output.output += (activation - clean_activations)
+        elif u.startswith("lnb"):
+            layer_idx = int(u[3:])
+            layer_module = model_ref.vit.encoder.layer[layer_idx]
+            layer_module.layernorm_before.output = activation
+        else:
+            raise NotImplementedError
 
     @staticmethod
     def EAP(model_nnsight, graph, dataloader

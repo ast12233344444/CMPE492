@@ -103,6 +103,44 @@ class SparseAutoencoder(nn.Module):
             grad_proj = (self.W_dec.grad * self.W_dec).sum(dim=1, keepdim=True) * self.W_dec
             self.W_dec.grad.sub_(grad_proj)
 
+class TopKSparseAutoencoder(nn.Module):
+    def __init__(self, input_dim=768, expansion_factor=8, k=128):
+        super().__init__()
+        self.input_dim = input_dim
+        self.hidden_dim = input_dim * expansion_factor
+        self.k = k
+
+        # Decoder Bias
+        self.b_dec = nn.Parameter(torch.zeros(input_dim))
+
+        # Encoder: Usually just a linear weight for Top-K
+        self.encoder = nn.Linear(input_dim, self.hidden_dim, bias=False)
+
+        # Decoder: Weight matrix (W_dec)
+        self.W_dec = nn.Parameter(torch.nn.init.kaiming_uniform_(
+            torch.empty(self.hidden_dim, input_dim)
+        ))
+
+    def forward(self, x):
+        # 1. Center the data
+        x_centered = x - self.b_dec
+
+        # 2. Linear Encoding
+        latents = self.encoder(x_centered)
+
+        # 3. Top-K Sparsity
+        # We only keep the top k activations. Others are set to 0.
+        topk_latents = torch.zeros_like(latents)
+        values, indices = torch.topk(latents, self.k, dim=-1)
+
+        # Using ReLU on the top-k values ensures non-negativity
+        topk_latents.scatter_(-1, indices, F.relu(values))
+
+        # 4. Decoding
+        decoded = F.linear(topk_latents, self.W_dec.t()) + self.b_dec
+
+        return topk_latents, decoded
+
 
 def evaluate_sae(model, dataloader, l1_coeff):
     model.eval()
@@ -165,6 +203,39 @@ def train_sae(model, train_loader, test_loader, l1_coeff, epochs=100):
         print(f"\nEpoch {epoch + 1} Summary:")
         print(f"  Train -> MSE: {total_mse / batch_count:.6f} | L1: {total_l1 / batch_count:.4f}")
         print(f"  Test  -> MSE: {test_mse:.6f} | L1: {test_l1:.4f} | L0: {test_l0:.1f}")
+
+def train_topk_sae(model, train_loader, test_loader, epochs=50):
+    optimizer = optim.Adam(model.parameters(), lr=3e-4)
+
+    for epoch in range(epochs):
+        model.train()
+        total_mse, batch_count = 0, 0
+
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}")
+        for batch in pbar:
+            x = batch.to(device)
+
+            encoded, decoded = model(x)
+
+            # Loss is just MSE for Top-K
+            loss = F.mse_loss(decoded, x)
+
+            optimizer.zero_grad()
+            loss.backward()
+            model.make_decoder_weights_and_grad_unit_norm()
+            optimizer.step()
+
+            total_mse += loss.item()
+            batch_count += 1
+
+            if batch_count % 50 == 0:
+                pbar.set_postfix({"mse": f"{loss.item():.4f}"})
+
+        # Run Evaluation
+        test_mse, _, test_l0 = evaluate_sae(model, test_loader, l1_coeff=0)
+        print(f"\nEpoch {epoch + 1} Summary:")
+        print(f"  Train -> MSE: {total_mse / batch_count:.6f}")
+        print(f"  Test  -> MSE: {test_mse:.6f} | L0: {test_l0:.1f} (Target K: {model.k})")
 
 def extract_feature_stats(SAE, dataloader, out_path, max_samples=100_000):
     # 1. Pre-allocate memory using a flat numpy array (float32 saves 50% RAM)
@@ -276,10 +347,11 @@ if __name__ == "__main__":
     # 1. Hyperparameters
     n_attention_layers = model.config.num_hidden_layers
     input_dim = 768  # ViT-Base hidd                                                                        en dim
-    expansion_factors = [16]
+    expansion_factors = [8]
     l1_coefficient = 1e-4  # Adjust lambda based on target sparsity (L0)
     batch_size = 2**14  # SAEs benefit from large batches
     learning_rate = 3e-4
+    k = 128
     nodes = [f"lnb{i}" for i in range(10, -1, -1)]#f"lnb{i}" for i in range(n_attention_layers)]
 
     if train:
@@ -288,17 +360,19 @@ if __name__ == "__main__":
             save_all_activations(model, loader_train_img, base_path, node, "train")
             save_all_activations(model, loader_test_img, base_path, node, "test")
             for expansion_factor in expansion_factors:
-                SAE_model = SparseAutoencoder(input_dim, expansion_factor).to(device)
+                #SAE_model = SparseAutoencoder(input_dim, expansion_factor).to(device)
+                SAE_model = TopKSparseAutoencoder(input_dim, expansion_factor, k=k).to(device)
                 optimizer = optim.Adam(SAE_model.parameters(), lr=learning_rate)
 
 
                 train_loader = DataLoader(BufferedActivationDataset(f"{base_path}/{node}/train"), batch_size=batch_size)
                 test_loader = DataLoader(BufferedActivationDataset(f"{base_path}/{node}/test"), batch_size=batch_size)
-                train_sae(SAE_model, train_loader, test_loader, l1_coeff=l1_coefficient)
+                #train_sae(SAE_model, train_loader, test_loader, l1_coeff=l1_coefficient)
+                train_topk_sae(SAE_model, train_loader, test_loader)
 
 
                 # Define the save path
-                model_name = f"sae_{node}_ef{expansion_factor}_l1{l1_coefficient}.pt"
+                model_name = f"sae_{node}_ef{expansion_factor}_top{k}.pt"
                 save_path = os.path.join(save_dir, model_name)
 
                 # Save the model and relevant metadata
@@ -313,7 +387,7 @@ if __name__ == "__main__":
                 if export_act:
                     act_stats_dir = f"{project_dir}/model_activation_stats"
                     os.makedirs(act_stats_dir, exist_ok=True)
-                    out_path = os.path.join(act_stats_dir, f"sae_{node}_ef{expansion_factor}_l1{l1_coefficient}.json")
+                    out_path = os.path.join(act_stats_dir, f"sae_{node}_ef{expansion_factor}_top{k}.json")
                     extract_feature_stats(SAE_model, train_loader, out_path)
 
                 print(f"Model saved successfully to {save_path}")
