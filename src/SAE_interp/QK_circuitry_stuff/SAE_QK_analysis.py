@@ -2,7 +2,6 @@ import gc
 import json
 import os
 
-import networkx as nx
 import numpy as np
 import torch
 from matplotlib import pyplot as plt
@@ -13,7 +12,6 @@ from tqdm import tqdm
 from src.TracingAlgorithms import TracingAlgorithms
 from src.SAE.train_sae import SparseAutoencoder
 import seaborn as sns
-from torch.nn import functional as F
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -151,19 +149,11 @@ def sample_feature_pairs(qk_values, index_vectors ,n_split, n_feature_per_split)
     return bounds, bound_samples
 
 def get_empirical_attention(model, activation_loc, head_i, SAE, dataloader, feature_pairs):
-    """
-    Calculates the average empirical attention score from source tokens (k) to
-    destination tokens (q) whenever specific SAE feature pairs are co-active.
-    """
-    # 1. Extract layer index from activation_loc (e.g., "lnb1" -> 1)
     layer_i = int(activation_loc[3:])
 
-    # 2. Force the HF model to output attention probabilities
     model.config.output_attentions = True
     head_dim = model.config.hidden_size // model.config.num_attention_heads
 
-    # 3. Initialize tracking dictionaries
-    # Ensure pairs are tuples so they are hashable dictionary keys
     pairs = [tuple(pair) for pair in feature_pairs]
     attention_sums = {pair: 0.0 for pair in pairs}
     attention_counts = {pair: 0 for pair in pairs}
@@ -233,30 +223,33 @@ def run_stats_big_matrix(matrix, L0_norm, layer, head, title, out_dir, s):
     plt.show()
 
 
-def get_th_emp_plots(layer, head, model, SAEs, SAE_act_stats, feat_presence_stats, dataloader, out_dir, empirical = False):
+def get_th_emp_plots(layer, head, model, SAEs, SAE_act_stats, feat_presence_stats, dataloader, out_dir, empirical = False, cumulative= True):
     qk_strength_matrix, feat_presence_matrix = calculate_qk_strengths(model, SAEs[f"lnb{layer}"], SAE_act_stats[f"lnb{layer}"],
                                                                       feat_presence_stats, layer, head)
     feat_presence_matrix = np.log(np.maximum(feat_presence_matrix, 1e-9))
     os.makedirs(f"{out_dir}/l{layer}_h{head}/", exist_ok=True)
     L0_norm = SAE_act_stats[f"lnb{layer}"]["l0_mean"]
 
+    if cumulative:
+        qk_strength_matrix = qk_strength_matrix * np.exp(feat_presence_matrix)
+
     qk_values = qk_strength_matrix.flatten()
-    flat_presence_values = feat_presence_matrix.flatten()
+    #flat_presence_values = feat_presence_matrix.flatten()
 
     run_stats_big_matrix(qk_strength_matrix, L0_norm, layer, head, "interaction_strength", out_dir, 5)
-    run_stats_big_matrix(qk_strength_matrix * np.exp(feat_presence_matrix), L0_norm, layer, head, "cumulative_strength", out_dir, 2)
+    #run_stats_big_matrix(qk_strength_matrix * np.exp(feat_presence_matrix), L0_norm, layer, head, "cumulative_strength", out_dir, 5)
 
+    sorted_1d_indices = np.argsort(qk_values)
+    qk_values = qk_values[sorted_1d_indices]
+    #flat_presence_values = flat_presence_values[sorted_1d_indices]
+
+    row_indices, col_indices = np.unravel_index(sorted_1d_indices, qk_strength_matrix.shape)
+
+    bounds, bound_samples = sample_feature_pairs(qk_values, (row_indices, col_indices), 10, 100)
+    with open(f"{out_dir}/l{layer}_h{head}/bound_samples.json", "w") as f:
+        json.dump([bound_sample.tolist() for bound_sample in bound_samples], f, indent=4)
 
     if empirical:
-        sorted_1d_indices = np.argsort(qk_values)
-        qk_values = qk_values[sorted_1d_indices]
-        flat_presence_values = flat_presence_values[sorted_1d_indices]
-
-        row_indices, col_indices = np.unravel_index(sorted_1d_indices, qk_strength_matrix.shape)
-
-        bounds, bound_samples = sample_feature_pairs(qk_values, (row_indices, col_indices), 10, 100)
-        with open(f"{out_dir}/l{layer}_h{head}/bound_samples.json", "w") as f:
-            json.dump([bound_sample.tolist() for bound_sample in bound_samples], f, indent=4)
 
         bound_samples_flat = np.concatenate(bound_samples)
         empirical_attetnion_data = get_empirical_attention(model, f"lnb{layer}", head, SAEs[f"lnb{layer}"], dataloader,
@@ -274,24 +267,6 @@ def get_th_emp_plots(layer, head, model, SAEs, SAE_act_stats, feat_presence_stat
 
                 bound_groups[i].append(empirical_attetnion_data[feature_pair])
         del row_indices, col_indices, sorted_1d_indices
-
-    lbound = np.mean(qk_values) - 5 * np.sqrt(L0_norm) * np.std(qk_values)
-    hbound = np.mean(qk_values) + 5 * np.sqrt(L0_norm) * np.std(qk_values)
-
-    ####FOR SCATTERPLOT#####
-    plt.figure(figsize=(10, 6))
-    qk_inliers = qk_values[(qk_values > lbound) & (qk_values < hbound)]
-    presence_inliers = flat_presence_values[(qk_values > lbound) & (qk_values < hbound)]
-    sample_idx = np.random.choice(len(qk_inliers), size=500000, replace=False)
-    qk_sample = qk_inliers[sample_idx]
-    presence_samples = presence_inliers[sample_idx]
-    plt.scatter(qk_sample[(qk_sample > lbound) & (qk_sample < hbound)], presence_samples[(qk_sample > lbound) & (qk_sample < hbound)], color='skyblue', alpha=0.7)
-    plt.scatter(qk_values[(qk_values < lbound) | (qk_values > hbound)], flat_presence_values[(qk_values < lbound) | (qk_values > hbound)], color='red', alpha=0.7)
-
-    plt.title(f"ScatterPlot of QK Interaction Strengths & presence probs (Layer {layer}, Head {head})", fontsize=14)
-    plt.xlabel("Interaction Strength", fontsize=12)
-    plt.ylabel("Frequency (Log Scale)", fontsize=12)
-    plt.grid(axis='y', linestyle='--', alpha=0.7)
 
 
     if empirical:
@@ -312,7 +287,7 @@ def get_th_emp_plots(layer, head, model, SAEs, SAE_act_stats, feat_presence_stat
         plt.savefig(f"{out_dir}/l{layer}_h{head}/emprirical_result.png", dpi=300)
         plt.show()
 
-    del qk_strength_matrix, feat_presence_matrix, qk_values, flat_presence_values, qk_inliers, presence_inliers
+    del qk_strength_matrix, feat_presence_matrix, qk_values
     gc.collect()
 
 
@@ -340,7 +315,7 @@ if __name__ == "__main__":
             SAE_act_stats[layer_name] = SAE_act_stat_json
 
             SAE_metadata = torch.load(os.path.join(SAE_dir, model_name_corr))
-            SAE_model = SparseAutoencoder(expansion_factor=SAE_metadata["expansion_factor"])
+            SAE_model = SparseAutoencoder(expansion_factor=SAE_metadata['expansion_factor'])
             SAE_model.load_state_dict(SAE_metadata["model_state_dict"])
             SAE_model = SAE_model.to(device)
             SAEs[layer_name] = SAE_model
@@ -360,8 +335,8 @@ if __name__ == "__main__":
         layerwise_presence_stats[layer] = tot_probs
 
     for head in tqdm(range(12), "heads"):
-        for layer in tqdm(range(11, -1, -1), "layers"):
-            get_th_emp_plots(layer, head, model, SAEs, SAE_act_stats, layerwise_presence_stats[layer], dataloader, results_dir)
+        for layer in tqdm(range(0, 12, 4), "layers"):
+            get_th_emp_plots(layer, head, model, SAEs, SAE_act_stats, layerwise_presence_stats[layer], dataloader, results_dir, empirical = True, cumulative = False)
 
 
 

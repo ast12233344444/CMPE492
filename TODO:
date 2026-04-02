@@ -1,0 +1,3 @@
+- finally output a csv file of ViT attn scores to finalise there
+- also find and output the interpretations about Gemma features.
+- can also find out about actual empirically maximized feature pairs and inv. them.

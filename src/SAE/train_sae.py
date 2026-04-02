@@ -131,7 +131,9 @@ class TopKSparseAutoencoder(nn.Module):
         # 3. Top-K Sparsity
         # We only keep the top k activations. Others are set to 0.
         topk_latents = torch.zeros_like(latents)
-        values, indices = torch.topk(latents, self.k, dim=-1)
+        topk_result = torch.topk(latents, self.k, dim=-1)
+        values = topk_result.values
+        indices = topk_result.indices
 
         # Using ReLU on the top-k values ensures non-negativity
         topk_latents.scatter_(-1, indices, F.relu(values))

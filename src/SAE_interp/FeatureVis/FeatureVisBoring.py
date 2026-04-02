@@ -14,7 +14,7 @@ from torchvision import datasets
 from tqdm import tqdm
 from transformers import ViTImageProcessor, ViTForImageClassification
 
-from src.SAE.train_sae import SparseAutoencoder
+from src.SAE.train_sae import SparseAutoencoder, TopKSparseAutoencoder
 from src.TracingAlgorithms import TracingAlgorithms
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -114,8 +114,8 @@ def get_features_from_csv(files):
 
 
 def OV_circuit_plotting_routine(model, dataloader, SAEs):
-    files = ["/home/ahmet/PycharmProjects/CMPE492/results/OV_dump/feature_potence_8.csv",
-             "/home/ahmet/PycharmProjects/CMPE492/results/OV_dump/feature_potence_9.csv"]
+    files = ["/home/ahmet/PycharmProjects/CMPE492/alternative_SAE/OV_dump/feature_potence_10.csv",
+             "/home/ahmet/PycharmProjects/CMPE492/alternative_SAE/OV_dump/feature_potence_11.csv"]
     locations = get_features_from_csv(files)
     print(locations)
 
@@ -124,7 +124,7 @@ def OV_circuit_plotting_routine(model, dataloader, SAEs):
 
 def QK_circuit_plotting_routine(model, dataloader, SAEs, nodes = None):
     n_layers = model.config.num_hidden_layers
-    QK_res_dir = "/results/QK_circuit_analysis"
+    QK_res_dir = "/home/ahmet/PycharmProjects/CMPE492/alternative_SAE/QK_circuit_analysis"
     if nodes == None:
         nodes = {layer: [] for layer in range(n_layers)}
         dir_QK_res = os.listdir(QK_res_dir)
@@ -174,30 +174,25 @@ def QK_circuit_plotting_routine(model, dataloader, SAEs, nodes = None):
 
 if __name__ == "__main__":
     model_id = 'nateraw/vit-base-patch16-224-cifar10'
-    SAE_dir = "/saved_models"
+    SAE_dir = "/home/ahmet/PycharmProjects/CMPE492/alternative_SAE/saved_models"
     saved_SAE_dir = os.listdir(SAE_dir)
     model = ViTForImageClassification.from_pretrained(model_id, attn_implementation="eager").to(device)
     processor = ViTImageProcessor.from_pretrained(model_id)
     model.eval()
     batch_size =32
-    dataset = datasets.CIFAR10(root='./data', train=True, download=True)
+    dataset = datasets.CIFAR10(root='../data', train=True, download=True)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
-
-
-
-    #locations = ["lnb11-10678", "lnb11-709", "lnb11-3544","lnb11-94", "lnb11-8724", "lnb11-3059", "lnb11-612",
-    #             "lnb10-3620", "lnb10-4500", "lnb10-3061", "lnb10-1759", "lnb10-2385", "lnb10-8176", "lnb10-9032"]
 
     SAEs = {}
     for saved_SAE_name in saved_SAE_dir:
         if "lnb" in saved_SAE_name:
             layer_name = saved_SAE_name.split("_")[1]
             SAE_metadata = torch.load(os.path.join(SAE_dir, saved_SAE_name))
-            SAE_model = SparseAutoencoder(expansion_factor=SAE_metadata["expansion_factor"])
+            SAE_model = TopKSparseAutoencoder(expansion_factor=8, k=64)
             SAE_model.load_state_dict(SAE_metadata["model_state_dict"])
             SAE_model = SAE_model.to(device)
             SAEs[layer_name] = SAE_model
 
-    #OV_circuit_plotting_routine(model, dataloader, SAEs)
+    OV_circuit_plotting_routine(model, dataloader, SAEs)
     QK_circuit_plotting_routine(model, dataloader, SAEs)
 

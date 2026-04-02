@@ -203,8 +203,20 @@ if __name__ == "__main__":
         train_loader=dataloader_train,
         test_loader=dataloader_test,
     )
+    for p in [0]:
+        for thresh in [2.5, 3, 3.5]:
+            print(f"testing for p={p} thresh={thresh}")
+            nullify_features_data = get_features_from_entropies(feature_entropy_data, feature_scattering_data, p=p,
+                                                                thresh=thresh)
+
+            wrapped_model = FeatureNullifiedVit(model, SAEs, nullify_features_data)
+
+            compare_model_performance(base_model=wrapped_model,
+                                      train_loader=dataloader_train,
+                                      test_loader=dataloader_test)
+
     for p in [3,4,5]:
-        for thresh in [0.05, 0.1, 0.25, 0.5, 1]:
+        for thresh in [0.05, 0.1, 0.25, 0.5]:
             print(f"testing for p={p} thresh={thresh}")
             nullify_features_data = get_features_from_entropies(feature_entropy_data, feature_scattering_data, p = p, thresh = thresh)
 

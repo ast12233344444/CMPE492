@@ -152,7 +152,7 @@ if __name__ == "__main__":
 
     print(f"Loading SAE: {sae_id}...")
 
-    for layer_idx in range(4, 18):
+    for layer_idx in range(5, 6):
         layers_to_get_firing = [layer_idx]
         densities = measure_scaled_feature_intensities(
             model_id="google/gemma-3-270m",

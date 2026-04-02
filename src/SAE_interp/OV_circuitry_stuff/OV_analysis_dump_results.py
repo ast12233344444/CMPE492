@@ -56,9 +56,9 @@ def plt_graph(graph, details = None, layer = -1):
 
 
 if __name__ == "__main__":
-    feature_potence_path = "/results/feature_potence_calc.json"
-    average_attention_data_path = "/results/avg_attention_scores.json"
-    out_path = "/results/OV_dump/"
+    feature_potence_path = "/home/ahmet/PycharmProjects/CMPE492/alternative_SAE/feature_potence_calc.json"
+    average_attention_data_path = "/home/ahmet/PycharmProjects/CMPE492/alternative_SAE/avg_attention_scores.json"
+    out_path = "/home/ahmet/PycharmProjects/CMPE492/alternative_SAE/OV_dump/"
     os.makedirs(out_path, exist_ok=True)
 
     feature_potence_data = json.load(open(feature_potence_path))
@@ -71,7 +71,7 @@ if __name__ == "__main__":
 
     features_per_layer = {}
     for layer_i in [10, 11]:
-        cutoff_effect = 1e-4
+        cutoff_effect = 3e-4
         n_toks = 197
         n_heads = 12
         full_layer_effect_datas_by_class = []

@@ -70,7 +70,7 @@ def _plot_single_feature(args):
 
 
 def save_top_k_visualizations(location_maximizers_max, location_maximisers_avg,
-                              save_dir="/home/ahmet/PycharmProjects/CMPE492/results/feature_maximisers", max_workers=8):
+                              save_dir="/home/ahmet/PycharmProjects/CMPE492/alternative_SAE/feature_maximizers", max_workers=8):
     """
     Prepares data and dispatches plotting tasks to a ProcessPool for parallel execution.
     """
