@@ -44,7 +44,6 @@ def get_stratified_subset(dataset, num_samples_per_class=500):
 def cache_full_empirical_attention(model, layer_name, layer_i, target_heads, num_features, SAE, dataloader, out_dir):
     os.makedirs(out_dir, exist_ok=True)
 
-    # Create a string representation of the heads (e.g., "0-1-2-3") to prevent overwriting
     heads_str = "-".join([str(h) for h in target_heads])
     save_path = os.path.join(out_dir, f"full_empirical_attn_{layer_name}_heads_{heads_str}.pt")
 
@@ -55,8 +54,8 @@ def cache_full_empirical_attention(model, layer_name, layer_i, target_heads, num
     num_target_heads = len(target_heads)
 
     # By limiting to target_heads, we drastically cut down RAM usage
-    total_sums = torch.zeros((num_target_heads, num_features, num_features), dtype=torch.float64, device='cpu')
-    total_counts = torch.zeros((num_features, num_features), dtype=torch.float64, device='cpu')
+    total_sums = torch.zeros((num_target_heads, num_features, num_features), dtype=torch.float32, device=device)
+    total_counts = torch.zeros((num_features, num_features), dtype=torch.float32, device=device)
 
     # Wrap in NNsight if it isn't already
     if not hasattr(model, 'trace'):
@@ -91,65 +90,43 @@ def cache_full_empirical_attention(model, layer_name, layer_i, target_heads, num
             # Process sequentially by batch item
             for b in range(current_batch_size):
                 F_b = feats_present[b]  # (Seq_Len, D)
-
-                # 1. Find features that fired AT LEAST ONCE in this sequence
                 F_b_sum = F_b.sum(dim=0)  # (D,)
-                active_idx = F_b_sum.nonzero(as_tuple=True)[0]
-
-                # If no features fired (extremely rare, but safe to check), skip
-                if active_idx.numel() == 0:
+                if F_b_sum.sum() == 0:
                     continue
+                total_counts.addr_(F_b_sum, F_b_sum)
 
-                # 2. Slice out only the active features. Shape becomes (Seq_Len, K)
-                F_b_active = F_b[:, active_idx]
-                F_b_sum_active = F_b_sum[active_idx]
-
-                # Prepare CPU indexing grids for the accumulators
-                row_idx = active_idx.unsqueeze(1).cpu()
-                col_idx = active_idx.unsqueeze(0).cpu()
-
-                # 3. Sparse Count Accumulation
-                counts_update = torch.outer(F_b_sum_active, F_b_sum_active).cpu().double()
-                total_counts[row_idx, col_idx] += counts_update
-
-                # 4. Sparse Attention Accumulation ONLY for target heads
+                # 4. Dense Attention Accumulation ONLY for target heads
                 for i, h in enumerate(target_heads):
                     A_bh = attns[b, h]  # (Seq_Len, Seq_Len)
-
-                    # Math equivalent: (K, Seq) @ (Seq, Seq) @ (Seq, K) => (K, K)
-                    sum_bh_active = (F_b_active.t() @ A_bh @ F_b_active).cpu().double()
-
-                    # Map the (K, K) sums directly back to the correct global indices at our mapped head index `i`
-                    total_sums[i, row_idx, col_idx] += sum_bh_active
+                    temp = torch.matmul(A_bh, F_b)
+                    total_sums[i].addmm_(F_b.t(), temp)
 
             # Memory management
             del feats, attns, feats_present, encoded_features, attention_probs
             gc.collect()
             torch.cuda.empty_cache()
+        print("Moving accumulators to CPU and calculating final averages...")
 
-    # Calculate final averages
-    print("Calculating final averages and casting back to float16...")
+        total_sums = total_sums.cpu()
+        total_counts = total_counts.cpu()
+        torch.cuda.empty_cache()
+        safe_counts = total_counts.clamp(min=1.0)
+        total_sums.div_(safe_counts.unsqueeze(0))
+        del safe_counts  # Free the clamped tensor
+        zero_mask = (total_counts == 0).unsqueeze(0).expand(num_target_heads, -1, -1)
+        total_sums[zero_mask] = 0.0
+        del zero_mask  # Free the mask
+        avg_attention = total_sums.to(torch.float16)
+        del total_sums  # Free the float32 tensor
+        print(f"Saving to disk at {save_path}...")
+        torch.save({
+            "target_heads": target_heads,
+            "avg_attention": avg_attention,
+            "pair_counts": total_counts.to(torch.int32)
+        }, save_path)
 
-    # Avoid division by zero
-    safe_counts = total_counts.clamp(min=1.0)
-    avg_attention = total_sums / safe_counts.unsqueeze(0)
-
-    # Zero out positions where the pair count was actually 0
-    zero_mask = (total_counts == 0).unsqueeze(0).expand(num_target_heads, -1, -1)
-    avg_attention[zero_mask] = 0.0
-
-    # Downcast back to float16 for storage
-    avg_attention = avg_attention.to(torch.float16)
-
-    print(f"Saving to disk at {save_path}...")
-    torch.save({
-        "target_heads": target_heads,  # Save the head mapping so you know what is in this file
-        "avg_attention": avg_attention,
-        "pair_counts": total_counts.to(torch.int32)
-    }, save_path)
-
-    print("Done!")
-    return avg_attention
+        print("Done!")
+        return avg_attention
 
 
 if __name__ == "__main__":
@@ -158,7 +135,7 @@ if __name__ == "__main__":
     model = ViTForImageClassification.from_pretrained(model_id, attn_implementation="eager").to(device)
     processor = ViTImageProcessor.from_pretrained(model_id)
     model.eval()
-    batch_size = 64
+    batch_size = 16
 
     dataset_full = datasets.CIFAR10(root='../data', train=True, download=True)
     subset = get_stratified_subset(dataset_full, num_samples_per_class=1000)
@@ -185,11 +162,11 @@ if __name__ == "__main__":
             SAEs[layer_name] = SAE_model
 
     NUM_FEATURES = int(768 * 16)
-    HEADSETS_TO_CACHE = [[0, 1, 2, 3], [4,5,6,7], [8,9,10,11]]
+    HEADSETS_TO_CACHE = [[i, i+1, i+2, i+3, i+4, i+5] for i in range(0, 12, 6)]
 
     cache_dir = "/home/ahmet/PycharmProjects/CMPE492/results/QK_circuit_analysis/caches"
 
-    for layer in tqdm(range(11, -1, -1), "Caching layers"):
+    for layer in tqdm(range(10, -1, -1), "Caching layers"):
         for HEADS_TO_CACHE in HEADSETS_TO_CACHE:
             layer_name = f"lnb{layer}"
 
