@@ -41,23 +41,21 @@ def get_stratified_subset(dataset, num_samples_per_class=500):
     return Subset(dataset, indices)
 
 
-def cache_full_empirical_attention(model, layer_name, layer_i, target_heads, num_features, SAE, dataloader, out_dir):
+def cache_full_empirical_attention(model, layer_name_dest, layer_name_src, layer_i, target_heads, num_features,
+                                   SAE_dest, SAE_src, dataloader, out_dir):
     os.makedirs(out_dir, exist_ok=True)
 
     heads_str = "-".join([str(h) for h in target_heads])
-    save_path = os.path.join(out_dir, f"full_empirical_attn_{layer_name}_heads_{heads_str}.pt")
+    save_path = os.path.join(out_dir, f"full_empirical_attn_{layer_name_dest}_heads_{heads_str}.pt")
 
     if os.path.exists(save_path):
         print(f"Cache already exists at {save_path}. Skipping.")
         return torch.load(save_path)
 
     num_target_heads = len(target_heads)
-
-    # By limiting to target_heads, we drastically cut down RAM usage
     total_sums = torch.zeros((num_target_heads, num_features, num_features), dtype=torch.float32, device=device)
     total_counts = torch.zeros((num_features, num_features), dtype=torch.float32, device=device)
 
-    # Wrap in NNsight if it isn't already
     if not hasattr(model, 'trace'):
         from nnsight import NNsight
         model = NNsight(model)
@@ -66,43 +64,59 @@ def cache_full_empirical_attention(model, layer_name, layer_i, target_heads, num
     head_dim = model.config.hidden_size // model.config.num_attention_heads
 
     with torch.no_grad():
-        for batch in tqdm(dataloader, desc=f"Caching Attention ({layer_name}, Heads {heads_str})"):
+        for batch in tqdm(dataloader,
+                          desc=f"Caching Attention ({layer_name_src} -> {layer_name_dest}, Heads {heads_str})"):
             x_batch, _ = batch
             x_batch = x_batch.to(model.device)
             current_batch_size = x_batch.size(0)
 
             with model.trace() as tracer:
                 with tracer.invoke(x_batch) as invoker:
-                    activations = TracingAlgorithms._get_activations(model, layer_name, head_dim)
+                    # 1. Extract Activations from BOTH layers
+                    act_dest = TracingAlgorithms._get_activations(model, layer_name_dest, head_dim)
+                    act_src = TracingAlgorithms._get_activations(model, layer_name_src, head_dim)
 
-                    encoded_features, _ = SAE(activations)
-                    encoded_features = encoded_features.save()
+                    # 2. Encode features using their respective SAEs
+                    encoded_dest, _ = SAE_dest(act_dest)
+                    encoded_src, _ = SAE_src(act_src)
 
-                    # Shape: (Batch, Total_Heads, Seq_Len, Seq_Len)
+                    encoded_dest = encoded_dest.save()
+                    encoded_src = encoded_src.save()
+
+                    # 3. Get the attention matrix from the DESTINATION layer
                     attention_probs = model.vit.encoder.layer[layer_i].attention.attention.output[1].save()
 
-            feats = encoded_features.value
+            feats_dest = encoded_dest.value
+            feats_src = encoded_src.value
             attns = attention_probs.value
 
-            # Binarize feature presence: (Batch, Seq_Len, Features)
-            feats_present = (feats > 0).float()
+            # Binarize feature presence
+            F_dest_present = (feats_dest > 0).float()
+            F_src_present = (feats_src > 0).float()
 
-            # Process sequentially by batch item
             for b in range(current_batch_size):
-                F_b = feats_present[b]  # (Seq_Len, D)
-                F_b_sum = F_b.sum(dim=0)  # (D,)
-                if F_b_sum.sum() == 0:
+                F_d = F_dest_present[b]  # (Seq_Len, D_dest)
+                F_s = F_src_present[b]  # (Seq_Len, D_src)
+
+                F_d_sum = F_d.sum(dim=0)  # (D_dest,)
+                F_s_sum = F_s.sum(dim=0)  # (D_src,)
+
+                if F_d_sum.sum() == 0 or F_s_sum.sum() == 0:
                     continue
-                total_counts.addr_(F_b_sum, F_b_sum)
 
-                # 4. Dense Attention Accumulation ONLY for target heads
+                # Cross-layer co-occurrence count
+                total_counts.addr_(F_d_sum, F_s_sum)
+
                 for i, h in enumerate(target_heads):
-                    A_bh = attns[b, h]  # (Seq_Len, Seq_Len)
-                    temp = torch.matmul(A_bh, F_b)
-                    total_sums[i].addmm_(F_b.t(), temp)
+                    A_bh = attns[b, h]  # (Seq_Len_dest, Seq_Len_src)
 
-            # Memory management
-            del feats, attns, feats_present, encoded_features, attention_probs
+                    # temp: (Seq_Len_dest, D_src)
+                    temp = torch.matmul(A_bh, F_s)
+
+                    # Add to total sums: (D_dest, D_src)
+                    total_sums[i].addmm_(F_d.t(), temp)
+
+            del feats_dest, feats_src, attns, F_dest_present, F_src_present, encoded_dest, encoded_src, attention_probs
             gc.collect()
             torch.cuda.empty_cache()
         print("Moving accumulators to CPU and calculating final averages...")
@@ -166,18 +180,20 @@ if __name__ == "__main__":
 
     cache_dir = "/home/ahmet/PycharmProjects/CMPE492/results/QK_circuit_analysis/caches"
 
-    for layer in tqdm(range(10, -1, -1), "Caching layers"):
+    for layer in tqdm(range(10, 0, -1), "Caching layers"):
         for HEADS_TO_CACHE in HEADSETS_TO_CACHE:
-            layer_name = f"lnb{layer}"
+            layer_name_dest = f"lnb{layer}"
+            layer_name_src = f"lnb{layer - 1}"
 
-            # Run the caching script
             avg_attention_cache = cache_full_empirical_attention(
                 model=model,
-                layer_name=layer_name,
+                layer_name_dest=layer_name_dest,
+                layer_name_src=layer_name_src,
                 layer_i=layer,
-                target_heads=HEADS_TO_CACHE,  # Pass the configurable heads here
+                target_heads=HEADS_TO_CACHE,
                 num_features=NUM_FEATURES,
-                SAE=SAEs[layer_name],
+                SAE_dest=SAEs[layer_name_dest],
+                SAE_src=SAEs[layer_name_src],
                 dataloader=dataloader,
                 out_dir=cache_dir
             )
