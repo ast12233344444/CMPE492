@@ -1,3 +1,4 @@
+import gc
 import json
 import os
 import torch
@@ -43,7 +44,7 @@ def calculate_all_scores_chunked(
         v_j_chunk = V_out[start_idx:end_idx]
 
         # a_ji attention weights for this chunk. Shape: (num_heads, C, F_in)
-        A_chunk = A_matrices[:, start_idx:end_idx, :]
+        A_chunk = A_matrices[:, start_idx:end_idx, :].to(device=device, dtype=torch.float32)
 
         # 1. Sum over heads: V = sum_{h} a_ji * (f_i * W_ov^(h) * v_i)
         # A_chunk is (num_heads, C, F_in)  -> 'h c i'
@@ -74,94 +75,95 @@ if __name__ == "__main__":
     model_id = 'nateraw/vit-base-patch16-224-cifar10'
     SAE_dir = "/home/ahmet/PycharmProjects/CMPE492/saved_models"
     SAE_stats_dir = "/home/ahmet/PycharmProjects/CMPE492/model_activation_stats"
-    cache_dir = "/home/ahmet/PycharmProjects/CMPE492/results/QK_circuit_analysis/caches"
-
-    layer_idx = 11
-    l_minus_1_node = f"lnb{layer_idx - 1}"
-    l_node = f"lnb{layer_idx}"
-
-    expansion_factor = 16
-    l1_coefficient = "0.0001"  # Update this to match your exact saved filename string
-    D = 768
-
-    # --- 2. Load Model & Extract ViT Components ---
+    cache_dir = "/media/external_drive/caches"
     model = ViTForImageClassification.from_pretrained(model_id).to(device)
     model.eval()
 
-    config = model.config
-    head_dim = config.hidden_size // config.num_attention_heads
-    num_heads = config.num_attention_heads
-    target_layer = model.vit.encoder.layer[layer_idx]
+    for layer_idx in range(11, 0, -1):
+        l_minus_1_node = f"lnb{layer_idx - 1}"
+        l_node = f"lnb{layer_idx}"
 
-    # W_l and b_l
-    W_l = target_layer.layernorm_before.weight.detach().to(device)
-    b_l = target_layer.layernorm_before.bias.detach().to(device)
+        expansion_factor = 16
+        l1_coefficient = "0.0001"  # Update this to match your exact saved filename string
+        D = 768
 
-    W_value = target_layer.attention.attention.value.weight.detach().to(device)
-    W_dense = target_layer.attention.output.dense.weight.detach().to(device)
+        config = model.config
+        head_dim = config.hidden_size // config.num_attention_heads
+        num_heads = config.num_attention_heads
+        target_layer = model.vit.encoder.layer[layer_idx]
 
-    # --- 3. Load SAE Features (v_i and v_j) using regular SparseAutoencoder ---
-    sae_l_minus_1_path = os.path.join(SAE_dir, f"sae_{l_minus_1_node}_ef{expansion_factor}_l1{l1_coefficient}.pt")
-    sae_l_path = os.path.join(SAE_dir, f"sae_{l_node}_ef{expansion_factor}_l1{l1_coefficient}.pt")
+        # W_l and b_l
+        W_l = target_layer.layernorm_before.weight.detach().to(device)
+        b_l = target_layer.layernorm_before.bias.detach().to(device)
 
-    sae_l_minus_1 = SparseAutoencoder(input_dim=D, expansion_factor=expansion_factor).to(device)
-    sae_l_minus_1.load_state_dict(torch.load(sae_l_minus_1_path)["model_state_dict"])
-    with open(os.path.join(SAE_stats_dir, f"sae_{l_minus_1_node}_ef{expansion_factor}_l1{l1_coefficient}.json"), "r") as f:
-        sae_l_minus_1_stats = json.load(f)["feature_means_nz"]
+        W_value = target_layer.attention.attention.value.weight.detach().to(device)
+        W_dense = target_layer.attention.output.dense.weight.detach().to(device)
 
-    sae_l = SparseAutoencoder(input_dim=D, expansion_factor=expansion_factor).to(device)
-    sae_l.load_state_dict(torch.load(sae_l_path)["model_state_dict"])
+        # --- 3. Load SAE Features (v_i and v_j) using regular SparseAutoencoder ---
+        sae_l_minus_1_path = os.path.join(SAE_dir, f"sae_{l_minus_1_node}_ef{expansion_factor}_l1{l1_coefficient}.pt")
+        sae_l_path = os.path.join(SAE_dir, f"sae_{l_node}_ef{expansion_factor}_l1{l1_coefficient}.pt")
 
-    V_in = sae_l_minus_1.W_dec.detach().to(device)  # v_i
-    V_out = sae_l.W_dec.detach().to(device)  # v_j
-    F_in = V_in.shape[0]
+        sae_l_minus_1 = SparseAutoencoder(input_dim=D, expansion_factor=expansion_factor).to(device)
+        sae_l_minus_1.load_state_dict(torch.load(sae_l_minus_1_path)["model_state_dict"])
+        with open(os.path.join(SAE_stats_dir, f"sae_{l_minus_1_node}_ef{expansion_factor}_l1{l1_coefficient}.json"), "r") as f:
+            sae_l_minus_1_stats = json.load(f)["feature_means_nz"]
 
-    # --- 4. Load Attention Cache (a_ji) ---
-    head_gorups = ["0-1-2-3", "4-5-6-7", "8-9-10-11"]
-    A_matrices = []
-    target_heads = []
-    for head_group in head_gorups:
-        attn_cache_path = os.path.join(cache_dir, f"full_empirical_attn_{l_node}_heads_{head_group}.pt")
-        attn_data = torch.load(attn_cache_path, map_location=device)
+        sae_l = SparseAutoencoder(input_dim=D, expansion_factor=expansion_factor).to(device)
+        sae_l.load_state_dict(torch.load(sae_l_path)["model_state_dict"])
 
-        target_heads.extend(attn_data["target_heads"])
-        A_matrices.append(attn_data["avg_attention"].float().to(device))
+        V_in = sae_l_minus_1.W_dec.detach().to(device)  # v_i
+        V_out = sae_l.W_dec.detach().to(device)  # v_j
+        F_in = V_in.shape[0]
 
-    A_matrices = torch.cat(A_matrices, dim=0)
+        # --- 4. Load Attention Cache (a_ji) ---
+        sigma_l_val = 1.0  # Standard deviation placeholder
+        head_gorups = ["0-1-2-3-4-5", "6-7-8-9-10-11"]
+        A_matrices = []
+        target_heads = []
+        for head_group in head_gorups:
+            attn_cache_path = os.path.join(cache_dir, f"full_empirical_attn_{l_minus_1_node}->{l_node}_heads_{head_group}.pt")
+            attn_data = torch.load(attn_cache_path, map_location="cpu")
 
-    # --- 5. Prepare Head Matrices (W_ov^(h)) ---
-    W_ov_target_heads = []
-    for h in target_heads:
-        W_V_h = W_value[h * head_dim: (h + 1) * head_dim, :]
-        W_O_h = W_dense[:, h * head_dim: (h + 1) * head_dim]
-        W_ov_target_heads.append(W_O_h @ W_V_h)
+            target_heads.extend(attn_data["target_heads"])
+            A_matrices.append(attn_data["avg_attention"].float())
+            sigma_l_val = attn_data["avg_layer_std"]
 
-    W_ov_target_heads = torch.stack(W_ov_target_heads)
+        A_matrices = torch.cat(A_matrices, dim=0)
 
-    # --- 6. Set Constants (sigma_l and f_i) ---
-    sigma_l_val = 1.0  # Standard deviation placeholder
+        # --- 5. Prepare Head Matrices (W_ov^(h)) ---
+        W_ov_target_heads = []
+        for h in target_heads:
+            W_V_h = W_value[h * head_dim: (h + 1) * head_dim, :]
+            W_O_h = W_dense[:, h * head_dim: (h + 1) * head_dim]
+            W_ov_target_heads.append(W_O_h @ W_V_h)
 
-    # Placeholder for actual source feature activation stats
+        W_ov_target_heads = torch.stack(W_ov_target_heads)
 
-    f_i_activations = torch.tensor(sae_l_minus_1_stats, device=device)
+        # --- 6. Set Constants (sigma_l and f_i) ---
 
-    # --- 7. Run Calculation ---
-    print(f"Starting calculation for Layer {layer_idx - 1} -> Layer {layer_idx}")
-    full_score_matrix = calculate_all_scores_chunked(
-        V_in=V_in,
-        V_out=V_out,
-        A_matrices=A_matrices,
-        W_ov_heads=W_ov_target_heads,
-        W_l=W_l,
-        b_l=b_l,
-        sigma_l=sigma_l_val,
-        f_i_activations=f_i_activations,
-        chunk_size=128
-    )
+        # Placeholder for actual source feature activation stats
 
-    print(f"Finished! Score Matrix Shape: {full_score_matrix.shape}")
+        f_i_activations = torch.tensor(sae_l_minus_1_stats, device=device)
 
-    save_out_path = os.path.join(cache_dir,
-                                 f"interaction_scores_{l_minus_1_node}_to_{l_node}_heads_{target_heads_str}.pt")
-    torch.save(full_score_matrix.cpu(), save_out_path)
-    print(f"Saved scores to {save_out_path}")
+        # --- 7. Run Calculation ---
+        print(f"Starting calculation for Layer {layer_idx - 1} -> Layer {layer_idx}")
+        full_score_matrix = calculate_all_scores_chunked(
+            V_in=V_in,
+            V_out=V_out,
+            A_matrices=A_matrices,
+            W_ov_heads=W_ov_target_heads,
+            W_l=W_l,
+            b_l=b_l,
+            sigma_l=sigma_l_val,
+            f_i_activations=f_i_activations,
+            chunk_size=32
+        )
+
+        print(f"Finished! Score Matrix Shape: {full_score_matrix.shape}")
+
+        save_out_path = os.path.join(cache_dir,f"interaction_scores_{l_minus_1_node}_to_{l_node}.pt")
+        torch.save(full_score_matrix.cpu(), save_out_path)
+        print(f"Saved scores to {save_out_path}")
+
+        torch.cuda.empty_cache()
+        gc.collect()

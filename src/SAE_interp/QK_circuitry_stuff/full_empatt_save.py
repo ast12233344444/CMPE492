@@ -23,7 +23,7 @@ def collate_fn(examples):
     return inputs['pixel_values'], labels
 
 
-def get_stratified_subset(dataset, num_samples_per_class=500):
+def get_stratified_subset(dataset, num_samples_per_class=10):
     """
     Creates a perfectly balanced subset of CIFAR-10.
     num_samples_per_class=500 yields 5,000 images total (10% of CIFAR-10).
@@ -46,15 +46,15 @@ def cache_full_empirical_attention(model, layer_name_dest, layer_name_src, layer
     os.makedirs(out_dir, exist_ok=True)
 
     heads_str = "-".join([str(h) for h in target_heads])
-    save_path = os.path.join(out_dir, f"full_empirical_attn_{layer_name_dest}_heads_{heads_str}.pt")
-
-    if os.path.exists(save_path):
-        print(f"Cache already exists at {save_path}. Skipping.")
-        return torch.load(save_path)
+    save_path = os.path.join(out_dir, f"full_empirical_attn_{layer_name_src}->{layer_name_dest}_heads_{heads_str}.pt")
 
     num_target_heads = len(target_heads)
     total_sums = torch.zeros((num_target_heads, num_features, num_features), dtype=torch.float32, device=device)
     total_counts = torch.zeros((num_features, num_features), dtype=torch.float32, device=device)
+
+    # Trackers for average standard deviation across all tokens
+    total_std_sum = 0.0
+    total_std_count = 0
 
     if not hasattr(model, 'trace'):
         from nnsight import NNsight
@@ -76,15 +76,21 @@ def cache_full_empirical_attention(model, layer_name_dest, layer_name_src, layer
                     act_dest = TracingAlgorithms._get_activations(model, layer_name_dest, head_dim)
                     act_src = TracingAlgorithms._get_activations(model, layer_name_src, head_dim)
 
-                    # 2. Encode features using their respective SAEs
+                    ln_input = model.vit.encoder.layer[layer_i].layernorm_before.input[0]
+                    act_dest_std = ln_input.std(dim=-1, unbiased=False).save()
+
                     encoded_dest, _ = SAE_dest(act_dest)
                     encoded_src, _ = SAE_src(act_src)
 
                     encoded_dest = encoded_dest.save()
                     encoded_src = encoded_src.save()
 
-                    # 3. Get the attention matrix from the DESTINATION layer
                     attention_probs = model.vit.encoder.layer[layer_i].attention.attention.output[1].save()
+
+            # Accumulate Standard Deviation data
+            std_val = act_dest_std.value
+            total_std_sum += std_val.sum().item()
+            total_std_count += std_val.numel()  # Number of tokens total in this batch
 
             feats_dest = encoded_dest.value
             feats_src = encoded_src.value
@@ -132,11 +138,16 @@ def cache_full_empirical_attention(model, layer_name_dest, layer_name_src, layer
         del zero_mask  # Free the mask
         avg_attention = total_sums.to(torch.float16)
         del total_sums  # Free the float32 tensor
-        print(f"Saving to disk at {save_path}...")
+
+        # Calculate final average standard deviation
+        avg_std = total_std_sum / total_std_count if total_std_count > 0 else 1.0
+
+        print(f"Saving to disk at {save_path}... avg std: {avg_std}")
         torch.save({
             "target_heads": target_heads,
             "avg_attention": avg_attention,
-            "pair_counts": total_counts.to(torch.int32)
+            "pair_counts": total_counts.to(torch.int32),
+            "avg_layer_std": float(avg_std)
         }, save_path)
 
         print("Done!")
@@ -178,9 +189,9 @@ if __name__ == "__main__":
     NUM_FEATURES = int(768 * 16)
     HEADSETS_TO_CACHE = [[i, i+1, i+2, i+3, i+4, i+5] for i in range(0, 12, 6)]
 
-    cache_dir = "/home/ahmet/PycharmProjects/CMPE492/results/QK_circuit_analysis/caches"
+    cache_dir = "/media/external_drive/caches"
 
-    for layer in tqdm(range(10, 0, -1), "Caching layers"):
+    for layer in tqdm(range(11, 0, -1), "Caching layers"):
         for HEADS_TO_CACHE in HEADSETS_TO_CACHE:
             layer_name_dest = f"lnb{layer}"
             layer_name_src = f"lnb{layer - 1}"
