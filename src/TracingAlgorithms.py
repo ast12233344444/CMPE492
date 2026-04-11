@@ -773,7 +773,7 @@ class TracingAlgorithms:
         plt.legend()
         plt.grid(True, alpha=0.3)
 
-        filename = f"results/trace_scatter_act_{u}_lda{"_reduce_mean" if reduce_mean else ""}.png"
+        filename = f"results/trace_scatter_act_{u}_lda{'_reduce_mean' if reduce_mean else ''}.png"
         plt.savefig(filename)
         plt.close()  # Close memory reference
 

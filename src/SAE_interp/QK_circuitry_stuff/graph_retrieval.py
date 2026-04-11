@@ -15,7 +15,6 @@ def calculate_all_scores_chunked(
         A_matrices: torch.Tensor,  # Attention cache, shape: (num_heads, F_out, F_in) -> A[h, j, i] = a_ji
         W_ov_heads: torch.Tensor,  # W_OV for targeted heads, shape: (num_heads, D, D)
         W_l: torch.Tensor,  # LayerNorm weight, shape: (D,)
-        b_l: torch.Tensor,  # LayerNorm bias, shape: (D,)
         sigma_l: float,  # Standard deviation scalar
         f_i_activations: torch.Tensor,  # Magnitudes for source features, shape: (F_in,)
         chunk_size: int = 128  # Chunking over destination features to manage VRAM
@@ -57,7 +56,7 @@ def calculate_all_scores_chunked(
         V_mean = V.mean(dim=-1, keepdim=True)  # Shape: (C, F_in, 1)
 
         # 3. Calculate LayerNorm: LN_l(V) = b_l + W_l * (V - Proj_{->1}(V)) / sigma_l
-        LN_V = b_l + W_l * (V - V_mean) / sigma_l  # Shape: (C, F_in, D)
+        LN_V = W_l * (V - V_mean) / sigma_l  # Shape: (C, F_in, D)
 
         # 4. Final Score Projection: Proj_{v_j}[LN_l(V)]
         # Dot product of LN_V (C, F_in, D) with v_j (C, D) across the D dimension.
@@ -73,9 +72,9 @@ def calculate_all_scores_chunked(
 if __name__ == "__main__":
     # --- 1. Settings & Paths ---
     model_id = 'nateraw/vit-base-patch16-224-cifar10'
-    SAE_dir = "/home/ahmet/PycharmProjects/CMPE492/saved_models"
-    SAE_stats_dir = "/home/ahmet/PycharmProjects/CMPE492/model_activation_stats"
-    cache_dir = "/media/external_drive/caches"
+    SAE_dir = "C:\\Users\\ast12\\PycharmProjects\\CMPE492\\saved_models"
+    SAE_stats_dir = f"C:\\Users\\ast12\\PycharmProjects\\CMPE492\\model_activation_stats"
+    cache_dir = "C:\\Users\\ast12\\PycharmProjects\\CMPE492\\results\\attn_caches"
     model = ViTForImageClassification.from_pretrained(model_id).to(device)
     model.eval()
 
@@ -116,12 +115,11 @@ if __name__ == "__main__":
         F_in = V_in.shape[0]
 
         # --- 4. Load Attention Cache (a_ji) ---
-        sigma_l_val = 1.0  # Standard deviation placeholder
         head_gorups = ["0-1-2-3-4-5", "6-7-8-9-10-11"]
         A_matrices = []
         target_heads = []
         for head_group in head_gorups:
-            attn_cache_path = os.path.join(cache_dir, f"full_empirical_attn_{l_minus_1_node}->{l_node}_heads_{head_group}.pt")
+            attn_cache_path = os.path.join(cache_dir, f"full_empirical_attn_{l_minus_1_node}-{l_node}_heads_{head_group}.pt")
             attn_data = torch.load(attn_cache_path, map_location="cpu")
 
             target_heads.extend(attn_data["target_heads"])
@@ -141,8 +139,6 @@ if __name__ == "__main__":
 
         # --- 6. Set Constants (sigma_l and f_i) ---
 
-        # Placeholder for actual source feature activation stats
-
         f_i_activations = torch.tensor(sae_l_minus_1_stats, device=device)
 
         # --- 7. Run Calculation ---
@@ -153,7 +149,6 @@ if __name__ == "__main__":
             A_matrices=A_matrices,
             W_ov_heads=W_ov_target_heads,
             W_l=W_l,
-            b_l=b_l,
             sigma_l=sigma_l_val,
             f_i_activations=f_i_activations,
             chunk_size=32

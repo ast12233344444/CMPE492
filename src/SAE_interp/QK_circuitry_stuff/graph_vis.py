@@ -123,12 +123,12 @@ def trace_feature_lineage(
 if __name__ == "__main__":
     # --- 1. Configuration & Paths ---
     model_id = 'nateraw/vit-base-patch16-224-cifar10'
-    CACHE_DIR = "/media/external_drive/caches"
-    SAE_DIR = "/home/ahmet/PycharmProjects/CMPE492/saved_models"
-    VIS_OUTPUT_DIR = "/media/external_drive/lineage_visualizations"
+    CACHE_DIR = "C:\\Users\\ast12\\PycharmProjects\\CMPE492\\results\\attn_caches"
+    SAE_DIR = "C:\\Users\\ast12\\PycharmProjects\\CMPE492\\saved_models"
+    VIS_OUTPUT_DIR = "C:\\Users\\ast12\\PycharmProjects\\CMPE492\\results\\lineage_visualizations"
 
     TARGET_LAYER = 11
-    TARGET_FEATURE = 11034
+    TARGET_FEATURE = 11759
     STOP_LAYER = 6
     TOP_K_CONTRIBUTORS = 5  # How many ancestors per layer to trace/plot
     N_IMG_SAMPLES = 5  # How many images to plot per feature
@@ -157,7 +157,7 @@ if __name__ == "__main__":
     model.eval()
 
     batch_size = 32
-    dataset = datasets.CIFAR10(root='../data', train=True, download=True)
+    dataset = datasets.CIFAR10(root='..\\data', train=True, download=True)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
 
     # --- 4. Load only the Required SAEs ---

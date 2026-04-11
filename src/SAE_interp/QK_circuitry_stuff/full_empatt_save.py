@@ -46,7 +46,7 @@ def cache_full_empirical_attention(model, layer_name_dest, layer_name_src, layer
     os.makedirs(out_dir, exist_ok=True)
 
     heads_str = "-".join([str(h) for h in target_heads])
-    save_path = os.path.join(out_dir, f"full_empirical_attn_{layer_name_src}->{layer_name_dest}_heads_{heads_str}.pt")
+    save_path = os.path.join(out_dir, f"full_empirical_attn_{layer_name_src}-{layer_name_dest}_heads_{heads_str}.pt")
 
     num_target_heads = len(target_heads)
     total_sums = torch.zeros((num_target_heads, num_features, num_features), dtype=torch.float32, device=device)
@@ -162,13 +162,12 @@ if __name__ == "__main__":
     model.eval()
     batch_size = 16
 
-    dataset_full = datasets.CIFAR10(root='../data', train=True, download=True)
+    dataset_full = datasets.CIFAR10(root='..\\data', train=True, download=True)
     subset = get_stratified_subset(dataset_full, num_samples_per_class=1000)
     dataloader = DataLoader(subset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
 
-    SAE_dir = "/home/ahmet/PycharmProjects/CMPE492/saved_models"
-    SAE_act_stats_dir = f"/home/ahmet/PycharmProjects/CMPE492/model_activation_stats"
-    results_dir = f"/home/ahmet/PycharmProjects/CMPE492/results/QK_circuit_analysis"
+    SAE_dir = "C:\\Users\\ast12\\PycharmProjects\\CMPE492\\saved_models"
+    SAE_act_stats_dir = f"C:\\Users\\ast12\\PycharmProjects\\CMPE492\\model_activation_stats"
     os.makedirs(SAE_act_stats_dir, exist_ok=True)
     saved_SAE_act_stats = os.listdir(SAE_act_stats_dir)
     SAEs = {}
@@ -189,9 +188,9 @@ if __name__ == "__main__":
     NUM_FEATURES = int(768 * 16)
     HEADSETS_TO_CACHE = [[i, i+1, i+2, i+3, i+4, i+5] for i in range(0, 12, 6)]
 
-    cache_dir = "/media/external_drive/caches"
+    cache_dir = "C:\\Users\\ast12\\PycharmProjects\\CMPE492\\results\\attn_caches"
 
-    for layer in tqdm(range(11, 0, -1), "Caching layers"):
+    for layer in tqdm(range(7, 0, -1), "Caching layers"):
         for HEADS_TO_CACHE in HEADSETS_TO_CACHE:
             layer_name_dest = f"lnb{layer}"
             layer_name_src = f"lnb{layer - 1}"
