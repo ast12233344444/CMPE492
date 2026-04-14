@@ -117,7 +117,7 @@ def cache_full_empirical_attention(model, layer_name_dest, layer_name_src, layer
                     A_bh = attns[b, h]  # (Seq_Len_dest, Seq_Len_src)
 
                     # temp: (Seq_Len_dest, D_src)
-                    temp = torch.matmul(A_bh, F_s)
+                    temp = torch.matmul(A_bh, feats_src[b])
 
                     # Add to total sums: (D_dest, D_src)
                     total_sums[i].addmm_(F_d.t(), temp)
@@ -150,8 +150,11 @@ def cache_full_empirical_attention(model, layer_name_dest, layer_name_src, layer
             "avg_layer_std": float(avg_std)
         }, save_path)
 
+        # TO THIS:
+        del avg_attention
+        gc.collect()
         print("Done!")
-        return avg_attention
+        return True
 
 
 if __name__ == "__main__":
@@ -190,7 +193,7 @@ if __name__ == "__main__":
 
     cache_dir = "C:\\Users\\ast12\\PycharmProjects\\CMPE492\\results\\attn_caches"
 
-    for layer in tqdm(range(7, 0, -1), "Caching layers"):
+    for layer in tqdm(range(11, 0, -1), "Caching layers"):
         for HEADS_TO_CACHE in HEADSETS_TO_CACHE:
             layer_name_dest = f"lnb{layer}"
             layer_name_src = f"lnb{layer - 1}"
@@ -207,3 +210,6 @@ if __name__ == "__main__":
                 dataloader=dataloader,
                 out_dir=cache_dir
             )
+            # ADD THESE TWO LINES TO CLEAR RAM BETWEEN HEAD GROUPS:
+            gc.collect()
+            torch.cuda.empty_cache()

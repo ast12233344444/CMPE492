@@ -33,7 +33,7 @@ def calculate_all_scores_chunked(
 
     # Pre-multiply by f_i (source activation magnitudes)
     # Shape of f_i is (F_in,). We reshape to broadcast: (1, F_in, 1)
-    scaled_W_ov_V_in = f_i_activations.view(1, F_in, 1) * W_ov_V_in
+    #scaled_W_ov_V_in = f_i_activations.view(1, F_in, 1) * W_ov_V_in
 
     # Process destination features in chunks
     for start_idx in tqdm(range(0, F_out, chunk_size), desc="Calculating Scores"):
@@ -49,7 +49,7 @@ def calculate_all_scores_chunked(
         # A_chunk is (num_heads, C, F_in)  -> 'h c i'
         # scaled_W_ov_V_in is (num_heads, F_in, D) -> 'h i d'
         # We want V of shape (C, F_in, D) -> 'c i d'
-        V = torch.einsum('hci, hid -> cid', A_chunk, scaled_W_ov_V_in)
+        V = torch.einsum('hci, hid -> cid', A_chunk, W_ov_V_in)
 
         # 2. Calculate Proj_{->1}(V)
         # Projection onto vector of ones is the mean across the D dimension
