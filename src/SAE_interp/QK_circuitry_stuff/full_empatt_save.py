@@ -51,6 +51,7 @@ def cache_full_empirical_attention(model, layer_name_dest, layer_name_src, layer
     num_target_heads = len(target_heads)
     total_sums = torch.zeros((num_target_heads, num_features, num_features), dtype=torch.float32, device=device)
     total_counts = torch.zeros((num_features, num_features), dtype=torch.float32, device=device)
+    feature_counts = torch.zeros((num_features), dtype=torch.float32, device=device)
 
     # Trackers for average standard deviation across all tokens
     total_std_sum = 0.0
@@ -99,6 +100,7 @@ def cache_full_empirical_attention(model, layer_name_dest, layer_name_src, layer
             # Binarize feature presence
             F_dest_present = (feats_dest > 0).float()
             F_src_present = (feats_src > 0).float()
+            feature_counts += F_src_present.sum(axis=0).sum(axis = 0)
 
             for b in range(current_batch_size):
                 F_d = F_dest_present[b]  # (Seq_Len, D_dest)
@@ -147,7 +149,8 @@ def cache_full_empirical_attention(model, layer_name_dest, layer_name_src, layer
             "target_heads": target_heads,
             "avg_attention": avg_attention,
             "pair_counts": total_counts.to(torch.int32),
-            "avg_layer_std": float(avg_std)
+            "avg_layer_std": float(avg_std),
+            "feature_counts_src": feature_counts
         }, save_path)
 
         # TO THIS:

@@ -16,7 +16,7 @@ def calculate_all_scores_chunked(
         W_ov_heads: torch.Tensor,  # W_OV for targeted heads, shape: (num_heads, D, D)
         W_l: torch.Tensor,  # LayerNorm weight, shape: (D,)
         sigma_l: float,  # Standard deviation scalar
-        f_i_activations: torch.Tensor,  # Magnitudes for source features, shape: (F_in,)
+        P_j_given_i: torch.Tensor,  # NEW: The probability multiplier matrix
         chunk_size: int = 128  # Chunking over destination features to manage VRAM
 ) -> torch.Tensor:
     F_out, D = V_out.shape
@@ -30,10 +30,6 @@ def calculate_all_scores_chunked(
     # Pre-calculate W_ov^(h) * v_i for all heads and source features
     # V_in is (F_in, D), W_ov_heads[h] is (D, D) -> Result: (num_heads, F_in, D)
     W_ov_V_in = torch.stack([torch.matmul(V_in, W_ov_heads[h].T) for h in range(num_heads)])
-
-    # Pre-multiply by f_i (source activation magnitudes)
-    # Shape of f_i is (F_in,). We reshape to broadcast: (1, F_in, 1)
-    #scaled_W_ov_V_in = f_i_activations.view(1, F_in, 1) * W_ov_V_in
 
     # Process destination features in chunks
     for start_idx in tqdm(range(0, F_out, chunk_size), desc="Calculating Scores"):
@@ -59,9 +55,11 @@ def calculate_all_scores_chunked(
         LN_V = W_l * (V - V_mean) / sigma_l  # Shape: (C, F_in, D)
 
         # 4. Final Score Projection: Proj_{v_j}[LN_l(V)]
-        # Dot product of LN_V (C, F_in, D) with v_j (C, D) across the D dimension.
-        # LN_V is 'c i d', v_j_chunk is 'c d'. We want score of shape (C, F_in) -> 'c i'
         score_chunk = torch.einsum('cid, cd -> ci', LN_V, v_j_chunk)
+
+        # --- NEW: Apply the Empirical Probability Gating ---
+        P_chunk = P_j_given_i[start_idx:end_idx, :].to(device)
+        score_chunk = score_chunk * P_chunk
 
         # Store in the final matrix
         final_scores[start_idx:end_idx, :] = score_chunk
@@ -111,24 +109,41 @@ if __name__ == "__main__":
         sae_l.load_state_dict(torch.load(sae_l_path)["model_state_dict"])
 
         V_in = sae_l_minus_1.W_dec.detach().to(device)  # v_i
-        V_out = sae_l.W_dec.detach().to(device)  # v_j
+        V_out = sae_l.encoder.weight.detach().to(device)  # Transposed to match (F_out, D)
         F_in = V_in.shape[0]
 
         # --- 4. Load Attention Cache (a_ji) ---
         head_gorups = ["0-1-2-3-4-5", "6-7-8-9-10-11"]
         A_matrices = []
         target_heads = []
+
+        # Trackers for the counts
+        pair_counts = None
+        src_counts = None
+
         for head_group in head_gorups:
-            attn_cache_path = os.path.join(cache_dir, f"full_empirical_attn_{l_minus_1_node}-{l_node}_heads_{head_group}.pt")
+            attn_cache_path = os.path.join(cache_dir,
+                                           f"full_empirical_attn_{l_minus_1_node}-{l_node}_heads_{head_group}.pt")
             attn_data = torch.load(attn_cache_path, map_location="cpu")
 
             target_heads.extend(attn_data["target_heads"])
             A_matrices.append(attn_data["avg_attention"].float())
             sigma_l_val = attn_data["avg_layer_std"]
 
+            # Load the counts only once from the first file
+            if pair_counts is None:
+                pair_counts = attn_data["pair_counts"].float()
+                # Note: using the correct key saved from full_empatt_save.py
+                src_counts = attn_data["feature_counts_src"].float()
+
         A_matrices = torch.cat(A_matrices, dim=0)
 
-        # --- 5. Prepare Head Matrices (W_ov^(h)) ---
+        # --- NEW: Calculate the P(j | i) matrix ---
+        # pair_counts shape: (F_out, F_in)
+        # src_counts shape: (F_in,) -> unsqueeze makes it (1, F_in) for broadcasting
+        # We clamp the denominator to 1.0 to prevent division by zero
+        P_j_given_i = (pair_counts / torch.clamp(src_counts.unsqueeze(0), min=1.0)).clamp(max=1.0)
+
         W_ov_target_heads = []
         for h in target_heads:
             W_V_h = W_value[h * head_dim: (h + 1) * head_dim, :]
@@ -137,11 +152,6 @@ if __name__ == "__main__":
 
         W_ov_target_heads = torch.stack(W_ov_target_heads)
 
-        # --- 6. Set Constants (sigma_l and f_i) ---
-
-        f_i_activations = torch.tensor(sae_l_minus_1_stats, device=device)
-
-        # --- 7. Run Calculation ---
         print(f"Starting calculation for Layer {layer_idx - 1} -> Layer {layer_idx}")
         full_score_matrix = calculate_all_scores_chunked(
             V_in=V_in,
@@ -150,7 +160,7 @@ if __name__ == "__main__":
             W_ov_heads=W_ov_target_heads,
             W_l=W_l,
             sigma_l=sigma_l_val,
-            f_i_activations=f_i_activations,
+            P_j_given_i=P_j_given_i,  # Pass our new matrix here!
             chunk_size=32
         )
 

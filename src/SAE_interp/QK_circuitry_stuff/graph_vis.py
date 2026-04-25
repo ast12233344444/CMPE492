@@ -127,8 +127,8 @@ if __name__ == "__main__":
     SAE_DIR = "C:\\Users\\ast12\\PycharmProjects\\CMPE492\\saved_models"
     VIS_OUTPUT_DIR = "C:\\Users\\ast12\\PycharmProjects\\CMPE492\\results\\lineage_visualizations"
 
-    TARGET_LAYER = 11
-    TARGET_FEATURE = 11034
+    TARGET_LAYER = 10
+    TARGET_FEATURE = 5638
     STOP_LAYER = 6
     TOP_K_CONTRIBUTORS = 5  # How many ancestors per layer to trace/plot
     N_IMG_SAMPLES = 5  # How many images to plot per feature
